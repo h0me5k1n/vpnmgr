@@ -30,7 +30,7 @@
 
 ### Start of script variables ###
 readonly SCRIPT_NAME="vpnmgr"
-readonly SCRIPT_VERSION="v3.0.1"
+readonly SCRIPT_VERSION="v3.1.0"
 SCRIPT_BRANCH="main"
 SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$SCRIPT_BRANCH"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
@@ -601,6 +601,16 @@ Conf_Exists(){
 				sed -i '/^vpn'"$i"'_type=.*/a vpn'"$i"'_customsettings=true' "$SCRIPT_CONF"
 			done
 		fi
+		if ! grep -q "_mute" "$SCRIPT_CONF"; then
+			for i in 1 2 3 4 5; do
+				sed -i '/^vpn'"$i"'_customsettings=.*/a vpn'"$i"'_mute=20' "$SCRIPT_CONF"
+			done
+		fi
+		if ! grep -q "_debugverb" "$SCRIPT_CONF"; then
+			for i in 1 2 3 4 5; do
+				sed -i '/^vpn'"$i"'_mute=.*/a vpn'"$i"'_debugverb=false' "$SCRIPT_CONF"
+			done
+		fi
 		return 0
 	else
 		for i in 1 2 3 4 5; do
@@ -611,6 +621,8 @@ Conf_Exists(){
 				echo "vpn${i}_protocol=UDP"
 				echo "vpn${i}_type=Standard"
 				echo "vpn${i}_customsettings=true"
+				echo "vpn${i}_mute=20"
+				echo "vpn${i}_debugverb=false"
 				echo "vpn${i}_schenabled=false"
 				echo "vpn${i}_schdays=*"
 				echo "vpn${i}_schhours=0"
@@ -1648,8 +1660,6 @@ SetVPNCustomSettings(){
 	vpncustomoptions='remote-random
 resolv-retry infinite
 remote-cert-tls server
-ping 15
-ping-restart 60
 ping-timer-rem
 persist-key
 persist-tun
@@ -1661,10 +1671,21 @@ rcvbuf 524288
 pull-filter ignore "auth-token"
 pull-filter ignore "ifconfig-ipv6"
 pull-filter ignore "route-ipv6"
-pull-filter ignore "ping"
-pull-filter ignore "ping-restart"
 auth-nocache'
-	
+
+	VPN_MUTE="$(grep "vpn${VPN_NO}_mute" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	[ -z "$VPN_MUTE" ] && VPN_MUTE="20"
+	if Validate_Number "$VPN_MUTE" && [ "$VPN_MUTE" -gt 0 ]; then
+		vpncustomoptions="$vpncustomoptions
+mute $VPN_MUTE"
+	fi
+
+	VPN_DEBUGVERB="$(grep "vpn${VPN_NO}_debugverb" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	if [ "$VPN_DEBUGVERB" = "true" ]; then
+		vpncustomoptions="$vpncustomoptions
+verb 4"
+	fi
+
 	if [ "$VPN_PROT_SHORT" = "UDP" ]; then
 		vpncustomoptions="$vpncustomoptions
 explicit-exit-notify 3"
@@ -1738,6 +1759,7 @@ MainMenu(){
 	printf "5.    Toggle scheduled VPN client update/reload\\n"
 	printf "6.    Update schedule for a VPN client\\n\\n"
 	printf "7.    Toggle %s custom settings for a VPN client\\n\\n" "$SCRIPT_NAME"
+	printf "8.    Configure logging settings for a VPN client\\n\\n"
 	printf "r.    Refresh cached data from VPN providers\\n\\n"
 	printf "u.    Check for updates\\n"
 	printf "uf.   Update %s with latest version (force)\\n\\n" "$SCRIPT_NAME"
@@ -1835,6 +1857,49 @@ MainMenu(){
 					else
 						sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_customsettings.*$/vpn'"$GLOBAL_VPN_NO"'_customsettings=false/' "$SCRIPT_CONF"
 					fi
+				fi
+				PressEnter
+				break
+			;;
+			8)
+				printf "\\n"
+				if SetVPNClient hide; then
+					if [ "$(grep "vpn${GLOBAL_VPN_NO}_managed" "$SCRIPT_CONF" | cut -f2 -d"=")" = "false" ]; then
+						Print_Output false "VPN client $GLOBAL_VPN_NO is not managed, cannot configure logging settings" "$ERR"
+						break
+					fi
+					while true; do
+						printf "\\n${BOLD}Please enter how many repeated identical OpenVPN log lines to collapse into one (0 to disable, default 20):${CLEARFORMAT}  "
+						read -r mute_choice
+						if Validate_Number "$mute_choice" && [ "$mute_choice" -ge 0 ]; then
+							break
+						else
+							printf "\\n\\e[31mPlease enter a number 0 or greater${CLEARFORMAT}\\n"
+						fi
+					done
+					while true; do
+						printf "\\n${BOLD}Enable verbose OpenVPN debug logging (verb 4) for this client? (y/n)${CLEARFORMAT}  "
+						read -r debugverb_choice
+						case "$debugverb_choice" in
+							y|Y)
+								debugverb_choice="true"
+								break
+							;;
+							n|N)
+								debugverb_choice="false"
+								break
+							;;
+							*)
+								printf "\\n\\e[31mPlease enter y or n${CLEARFORMAT}\\n"
+							;;
+						esac
+					done
+					sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_mute.*$/vpn'"$GLOBAL_VPN_NO"'_mute='"$mute_choice"'/' "$SCRIPT_CONF"
+					sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_debugverb.*$/vpn'"$GLOBAL_VPN_NO"'_debugverb='"$debugverb_choice"'/' "$SCRIPT_CONF"
+					if [ "$(grep "vpn${GLOBAL_VPN_NO}_customsettings" "$SCRIPT_CONF" | cut -f2 -d"=")" = "true" ]; then
+						SetVPNCustomSettings "$GLOBAL_VPN_NO"
+					fi
+					Print_Output true "Updated logging settings for VPN client $GLOBAL_VPN_NO" "$PASS"
 				fi
 				PressEnter
 				break
