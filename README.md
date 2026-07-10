@@ -101,6 +101,35 @@ Run `bash scripts/smoke-test.sh` locally before opening a PR — CI enforces thi
 
 All `.sh` files must be **busybox ash compatible**. No bash arrays, no `[[ ]]`, no `let`, no `declare`, no process substitution. The router does not have bash.
 
+## VPN keepalive & logging
+
+As of `v3.1.0`, vpnmgr no longer overrides the OpenVPN `ping`/`ping-restart`
+keepalive directives for any provider. Earlier versions hardcoded `ping 15`
+/ `ping-restart 60` and explicitly discarded whatever the VPN server itself
+pushed (`pull-filter ignore "ping"` / `pull-filter ignore "ping-restart"`).
+Since pushing tuned keepalive values via `PUSH_REPLY` is standard practice
+for commercial VPN providers (NordVPN's own published Asuswrt-Merlin setup
+guide, for example, sets only `ping-timer-rem` and relies on its servers'
+pushed values), the old override could turn brief, harmless network jitter
+into a full reconnect far more often than necessary — for some users this
+showed up as frequent `Inactivity timeout (--ping-restart), restarting`
+lines flooding the syslog. `ping-timer-rem` is still set, so the
+ping-restart countdown still resets on any received packet.
+
+**If you're upgrading from an earlier version**: this is a behaviour change
+for every managed VPN client — the actual keepalive timeout now comes from
+your provider instead of a fixed 60 seconds. If your provider (or its
+specific server) pushes an unusually short or missing keepalive and you see
+different reconnect behaviour after upgrading, please open an issue.
+
+Two new per-client settings (menu option `8`, or WebUI equivalent) control
+log volume and detail instead:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `mute` | `20` | Emits OpenVPN's `mute <N>` directive, collapsing N consecutive identical log lines into a single summary line. Set to `0` to disable. |
+| `debugverb` | `false` | When enabled, adds `verb 4` for detailed OpenVPN diagnostic logging. Leave off unless actively debugging a connection issue, since it increases log volume. |
+
 ## Known limitations
 
 - **NordVPN OVPN format**: vpnmgr downloads OVPN files from NordVPN's CDN, which still serves the v1 format (tls-auth, multiple `remote` lines). NordVPN's newer v2.6 format (tls-crypt, single `remote`) is only available via manual download from the NordVPN portal — no programmatic per-server URL is known. The v1 CDN files work correctly; upgrading to v2.6 would require NordVPN to expose an API endpoint for per-server downloads.
