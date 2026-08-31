@@ -171,7 +171,6 @@ proto ${_po_proto}
 remote ${_po_host} ${_po_port}
 resolv-retry infinite
 nobind
-persist-key
 persist-tun
 cipher ${_po_cipher}
 auth ${_po_auth}

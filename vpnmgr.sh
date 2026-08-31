@@ -30,7 +30,7 @@
 
 ### Start of script variables ###
 readonly SCRIPT_NAME="vpnmgr"
-readonly SCRIPT_VERSION="v3.1.0"
+readonly SCRIPT_VERSION="v3.2.0"
 SCRIPT_BRANCH="main"
 SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$SCRIPT_BRANCH"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
@@ -94,6 +94,13 @@ Firmware_Version_Check(){
 
 Firmware_Number_Check(){
 	echo "$1" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'
+}
+
+OpenVPN_Version_Number(){
+	# Echoes the router's OpenVPN version as a zero-padded integer for numeric
+	# comparison (e.g. 2007000 for 2.7.0). Empty if openvpn is missing or unparseable.
+	openvpn --version 2>/dev/null | awk 'NR==1 && $1=="OpenVPN" {
+		n=split($2,v,"."); printf("%d%03d%03d\n", v[1], v[2], (n>2?v[3]:0)); exit }'
 }
 
 ### Code for these functions inspired by https://github.com/Adamm00 - credit to @Adamm ###
@@ -1661,10 +1668,8 @@ SetVPNCustomSettings(){
 resolv-retry infinite
 remote-cert-tls server
 ping-timer-rem
-persist-key
 persist-tun
 reneg-sec 0
-fast-io
 mute-replay-warnings
 sndbuf 524288
 rcvbuf 524288
@@ -1672,6 +1677,15 @@ pull-filter ignore "auth-token"
 pull-filter ignore "ifconfig-ipv6"
 pull-filter ignore "route-ipv6"
 auth-nocache'
+
+	# persist-key and fast-io are ignored no-ops from OpenVPN 2.6 onwards (key
+	# persistence is automatic, fast-io was removed). Only add them for older clients.
+	VPN_OVPNVER="$(OpenVPN_Version_Number)"
+	if [ -z "$VPN_OVPNVER" ] || [ "$VPN_OVPNVER" -lt 2006000 ]; then
+		vpncustomoptions="$vpncustomoptions
+persist-key
+fast-io"
+	fi
 
 	VPN_MUTE="$(grep "vpn${VPN_NO}_mute" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	[ -z "$VPN_MUTE" ] && VPN_MUTE="20"
