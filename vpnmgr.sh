@@ -994,10 +994,9 @@ ManageVPN(){
 	VPN_NO="$1"
 	
 	if [ -z "$(nvram get vpn_client"$VPN_NO"_username)" ] && [ -z "$(nvram get vpn_client"$VPN_NO"_password)" ]; then
-		Print_Output false "No username or password set for VPN client $VPN_NO, cannot enable management" "$ERR"
-		return 1
+		Print_Output false "No credentials set for VPN client $VPN_NO yet - they will be required when you configure it" "$WARN"
 	fi
-	
+
 	Print_Output true "Enabling management of VPN client $VPN_NO"
 	sed -i 's/^vpn'"$VPN_NO"'_managed.*$/vpn'"$VPN_NO"'_managed=true/' "$SCRIPT_CONF"
 	Print_Output true "Management of VPN client $VPN_NO successfully enabled" "$PASS"
@@ -1814,6 +1813,27 @@ MainMenu(){
 				if SetVPNClient show; then
 					if [ "$(grep "vpn${GLOBAL_VPN_NO}_managed" "$SCRIPT_CONF" | cut -f2 -d"=")" = "false" ]; then
 						ManageVPN "$GLOBAL_VPN_NO"
+						if [ -z "$(nvram get vpn_client"$GLOBAL_VPN_NO"_addr)" ]; then
+							while true; do
+								printf "\\n${BOLD}VPN client %s has not been configured yet. Configure it now? (y/n)${CLEARFORMAT}  " "$GLOBAL_VPN_NO"
+								read -r confirm
+								case "$confirm" in
+									y|Y)
+										if Check_Lock menu; then
+											Menu_UpdateVPN
+										fi
+										break
+									;;
+									n|N)
+										printf "\\n"
+										break
+									;;
+									*)
+										printf "\\n${BOLD}Please enter a valid choice (y/n)${CLEARFORMAT}\\n"
+									;;
+								esac
+							done
+						fi
 					else
 						UnmanageVPN "$GLOBAL_VPN_NO"
 					fi
