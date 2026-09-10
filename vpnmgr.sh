@@ -30,7 +30,7 @@
 
 ### Start of script variables ###
 readonly SCRIPT_NAME="vpnmgr"
-readonly SCRIPT_VERSION="v3.2.0"
+readonly SCRIPT_VERSION="v3.2.1"
 SCRIPT_BRANCH="main"
 SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$SCRIPT_BRANCH"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
@@ -769,6 +769,11 @@ UpdateVPNConfig(){
 		shift
 	fi
 	VPN_NO="$1"
+	PRIOR_CONN_STATE="$2"
+	if [ -z "$PRIOR_CONN_STATE" ]; then
+		PRIOR_CONN_STATE="$(getConnectState "$VPN_NO")"
+		[ -z "$PRIOR_CONN_STATE" ] && PRIOR_CONN_STATE="0"
+	fi
 	VPN_PROVIDER="$(grep "vpn${VPN_NO}_provider" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	VPN_PROVIDER_LC="$(printf '%s' "$VPN_PROVIDER" | tr 'A-Z' 'a-z')"
 	VPN_PROT_SHORT="$(grep "vpn${VPN_NO}_protocol" "$SCRIPT_CONF" | cut -f2 -d"=")"
@@ -931,21 +936,34 @@ UpdateVPNConfig(){
 	retry="false"
 
 	if nvram get vpn_clientx_eas | grep -q "$VPN_NO"; then
+		VPN_RGW="$(nvram get vpn_client"$VPN_NO"_rgw)"
+
 		RestartVPNClient "$VPN_NO"
 
-		Print_Output true "Testing that VPN client $VPN_NO is up with a 10s ping test to 1.1.1.1 ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)"
+		Print_Output true "Checking that VPN client $VPN_NO establishes a connection ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)"
 		tunnelup="false"
 		for i in 1 2 3; do
-			if ping -w 10 -I "tun1$VPN_NO" 1.1.1.1 >/dev/null 2>&1; then
-				tunnelup="true"
-				break
-			else
-				RestartVPNClient "$VPN_NO"
-			fi
+			waited=0
+			while [ "$waited" -lt 20 ]; do
+				if [ "$(getConnectState "$VPN_NO")" = "2" ]; then
+					tunnelup="true"
+					break
+				fi
+				sleep 2
+				waited=$((waited + 2))
+			done
+			[ "$tunnelup" = "true" ] && break
+			RestartVPNClient "$VPN_NO"
 		done
 
+		if [ "$tunnelup" = "true" ] && [ "$VPN_RGW" = "1" ]; then
+			if ! ping -w 10 -I "tun1$VPN_NO" 1.1.1.1 >/dev/null 2>&1; then
+				Print_Output true "VPN client $VPN_NO connected but no traffic reached 1.1.1.1 through the tunnel - check routing/firewall ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$WARN"
+			fi
+		fi
+
 		if [ "$tunnelup" = "false" ]; then
-			Print_Output true "VPN client $VPN_NO did not come up after 3 attempts, please investigate! ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$CRIT"
+			Print_Output true "VPN client $VPN_NO did not connect after 3 attempts, please investigate! ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$CRIT"
 			if [ "$ISUNATTENDED" != "true" ]; then
 				while true; do
 					printf "${BOLD}Do you want to vpnmgr to retry? (y/n)${CLEARFORMAT}  "
@@ -967,13 +985,23 @@ UpdateVPNConfig(){
 			fi
 		else
 			Print_Output true "VPN client $VPN_NO is up! ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
+			if [ "$VPN_RGW" != "1" ] && [ "$VPN_RGW" != "2" ] && [ "$VPN_RGW" != "3" ]; then
+				Print_Output true "VPN client $VPN_NO is not routing any traffic yet - set 'Redirect Internet traffic through tunnel' to Yes (all) or configure VPN Director in the router WebUI" "$WARN"
+			fi
 		fi
 	fi
-	if [ "$retry" = "false" ]; then
-		Print_Output true "VPN client $VPN_NO updated ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
-	else
-		UpdateVPNConfig "$VPN_NO"
+
+	if [ "$retry" = "true" ]; then
+		UpdateVPNConfig "$VPN_NO" "$PRIOR_CONN_STATE"
+		return
 	fi
+
+	if [ "$PRIOR_CONN_STATE" != "2" ] && nvram get vpn_clientx_eas | grep -q "$VPN_NO" && [ "$(getConnectState "$VPN_NO")" = "2" ]; then
+		Print_Output true "VPN client $VPN_NO was not connected before configuration - stopping it again to restore that state" "$WARN"
+		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1
+	fi
+
+	Print_Output true "VPN client $VPN_NO updated ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
 }
 
 RestartVPNClient(){
