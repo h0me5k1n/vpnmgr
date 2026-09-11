@@ -30,7 +30,7 @@
 
 ### Start of script variables ###
 readonly SCRIPT_NAME="vpnmgr"
-readonly SCRIPT_VERSION="v3.1.0"
+readonly SCRIPT_VERSION="v3.2.2"
 SCRIPT_BRANCH="main"
 SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$SCRIPT_BRANCH"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
@@ -96,6 +96,13 @@ Firmware_Number_Check(){
 	echo "$1" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'
 }
 
+OpenVPN_Version_Number(){
+	# Echoes the router's OpenVPN version as a zero-padded integer for numeric
+	# comparison (e.g. 2007000 for 2.7.0). Empty if openvpn is missing or unparseable.
+	openvpn --version 2>/dev/null | awk 'NR==1 && $1=="OpenVPN" {
+		n=split($2,v,"."); printf("%d%03d%03d\n", v[1], v[2], (n>2?v[3]:0)); exit }'
+}
+
 ### Code for these functions inspired by https://github.com/Adamm00 - credit to @Adamm ###
 Check_Lock(){
 	if [ -f "/tmp/$SCRIPT_NAME.lock" ]; then
@@ -120,7 +127,7 @@ Check_Lock(){
 		fi
 	else
 		echo "$$" > "/tmp/$SCRIPT_NAME.lock"
-		trap 'Clear_Lock' INT TERM
+		trap 'Trap_Exit' INT TERM
 		return 0
 	fi
 }
@@ -128,6 +135,11 @@ Check_Lock(){
 Clear_Lock(){
 	rm -f "/tmp/$SCRIPT_NAME.lock" 2>/dev/null
 	return 0
+}
+
+Trap_Exit(){
+	Clear_Lock
+	exit 1
 }
 
 ###################################
@@ -762,6 +774,11 @@ UpdateVPNConfig(){
 		shift
 	fi
 	VPN_NO="$1"
+	PRIOR_CONN_STATE="$2"
+	if [ -z "$PRIOR_CONN_STATE" ]; then
+		PRIOR_CONN_STATE="$(getConnectState "$VPN_NO")"
+		[ -z "$PRIOR_CONN_STATE" ] && PRIOR_CONN_STATE="0"
+	fi
 	VPN_PROVIDER="$(grep "vpn${VPN_NO}_provider" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	VPN_PROVIDER_LC="$(printf '%s' "$VPN_PROVIDER" | tr 'A-Z' 'a-z')"
 	VPN_PROT_SHORT="$(grep "vpn${VPN_NO}_protocol" "$SCRIPT_CONF" | cut -f2 -d"=")"
@@ -924,21 +941,34 @@ UpdateVPNConfig(){
 	retry="false"
 
 	if nvram get vpn_clientx_eas | grep -q "$VPN_NO"; then
+		VPN_RGW="$(nvram get vpn_client"$VPN_NO"_rgw)"
+
 		RestartVPNClient "$VPN_NO"
 
-		Print_Output true "Testing that VPN client $VPN_NO is up with a 10s ping test to 1.1.1.1 ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)"
+		Print_Output true "Checking that VPN client $VPN_NO establishes a connection ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)"
 		tunnelup="false"
 		for i in 1 2 3; do
-			if ping -w 10 -I "tun1$VPN_NO" 1.1.1.1 >/dev/null 2>&1; then
-				tunnelup="true"
-				break
-			else
-				RestartVPNClient "$VPN_NO"
-			fi
+			waited=0
+			while [ "$waited" -lt 20 ]; do
+				if [ "$(getConnectState "$VPN_NO")" = "2" ]; then
+					tunnelup="true"
+					break
+				fi
+				sleep 2
+				waited=$((waited + 2))
+			done
+			[ "$tunnelup" = "true" ] && break
+			RestartVPNClient "$VPN_NO"
 		done
 
+		if [ "$tunnelup" = "true" ] && [ "$VPN_RGW" = "1" ]; then
+			if ! ping -w 10 -I "tun1$VPN_NO" 1.1.1.1 >/dev/null 2>&1; then
+				Print_Output true "VPN client $VPN_NO connected but no traffic reached 1.1.1.1 through the tunnel - check routing/firewall ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$WARN"
+			fi
+		fi
+
 		if [ "$tunnelup" = "false" ]; then
-			Print_Output true "VPN client $VPN_NO did not come up after 3 attempts, please investigate! ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$CRIT"
+			Print_Output true "VPN client $VPN_NO did not connect after 3 attempts, please investigate! ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$CRIT"
 			if [ "$ISUNATTENDED" != "true" ]; then
 				while true; do
 					printf "${BOLD}Do you want to vpnmgr to retry? (y/n)${CLEARFORMAT}  "
@@ -960,13 +990,23 @@ UpdateVPNConfig(){
 			fi
 		else
 			Print_Output true "VPN client $VPN_NO is up! ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
+			if [ "$VPN_RGW" != "1" ] && [ "$VPN_RGW" != "2" ] && [ "$VPN_RGW" != "3" ]; then
+				Print_Output true "VPN client $VPN_NO is not routing any traffic yet - set 'Redirect Internet traffic through tunnel' to Yes (all) or configure VPN Director in the router WebUI" "$WARN"
+			fi
 		fi
 	fi
-	if [ "$retry" = "false" ]; then
-		Print_Output true "VPN client $VPN_NO updated ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
-	else
-		UpdateVPNConfig "$VPN_NO"
+
+	if [ "$retry" = "true" ]; then
+		UpdateVPNConfig "$VPN_NO" "$PRIOR_CONN_STATE"
+		return
 	fi
+
+	if [ "$PRIOR_CONN_STATE" != "2" ] && nvram get vpn_clientx_eas | grep -q "$VPN_NO" && [ "$(getConnectState "$VPN_NO")" = "2" ]; then
+		Print_Output true "VPN client $VPN_NO was not connected before configuration - stopping it again to restore that state" "$WARN"
+		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1
+	fi
+
+	Print_Output true "VPN client $VPN_NO updated ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
 }
 
 RestartVPNClient(){
@@ -987,10 +1027,9 @@ ManageVPN(){
 	VPN_NO="$1"
 	
 	if [ -z "$(nvram get vpn_client"$VPN_NO"_username)" ] && [ -z "$(nvram get vpn_client"$VPN_NO"_password)" ]; then
-		Print_Output false "No username or password set for VPN client $VPN_NO, cannot enable management" "$ERR"
-		return 1
+		Print_Output false "No credentials set for VPN client $VPN_NO yet - they will be required when you configure it" "$WARN"
 	fi
-	
+
 	Print_Output true "Enabling management of VPN client $VPN_NO"
 	sed -i 's/^vpn'"$VPN_NO"'_managed.*$/vpn'"$VPN_NO"'_managed=true/' "$SCRIPT_CONF"
 	Print_Output true "Management of VPN client $VPN_NO successfully enabled" "$PASS"
@@ -1661,10 +1700,8 @@ SetVPNCustomSettings(){
 resolv-retry infinite
 remote-cert-tls server
 ping-timer-rem
-persist-key
 persist-tun
 reneg-sec 0
-fast-io
 mute-replay-warnings
 sndbuf 524288
 rcvbuf 524288
@@ -1672,6 +1709,15 @@ pull-filter ignore "auth-token"
 pull-filter ignore "ifconfig-ipv6"
 pull-filter ignore "route-ipv6"
 auth-nocache'
+
+	# persist-key and fast-io are ignored no-ops from OpenVPN 2.6 onwards (key
+	# persistence is automatic, fast-io was removed). Only add them for older clients.
+	VPN_OVPNVER="$(OpenVPN_Version_Number)"
+	if [ -z "$VPN_OVPNVER" ] || [ "$VPN_OVPNVER" -lt 2006000 ]; then
+		vpncustomoptions="$vpncustomoptions
+persist-key
+fast-io"
+	fi
 
 	VPN_MUTE="$(grep "vpn${VPN_NO}_mute" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	[ -z "$VPN_MUTE" ] && VPN_MUTE="20"
@@ -1800,6 +1846,27 @@ MainMenu(){
 				if SetVPNClient show; then
 					if [ "$(grep "vpn${GLOBAL_VPN_NO}_managed" "$SCRIPT_CONF" | cut -f2 -d"=")" = "false" ]; then
 						ManageVPN "$GLOBAL_VPN_NO"
+						if [ -z "$(nvram get vpn_client"$GLOBAL_VPN_NO"_addr)" ]; then
+							while true; do
+								printf "\\n${BOLD}VPN client %s has not been configured yet. Configure it now? (y/n)${CLEARFORMAT}  " "$GLOBAL_VPN_NO"
+								read -r confirm
+								case "$confirm" in
+									y|Y)
+										if Check_Lock menu; then
+											Menu_UpdateVPN
+										fi
+										break
+									;;
+									n|N)
+										printf "\\n"
+										break
+									;;
+									*)
+										printf "\\n${BOLD}Please enter a valid choice (y/n)${CLEARFORMAT}\\n"
+									;;
+								esac
+							done
+						fi
 					else
 						UnmanageVPN "$GLOBAL_VPN_NO"
 					fi
