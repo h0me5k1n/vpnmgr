@@ -30,7 +30,7 @@
 
 ### Start of script variables ###
 readonly SCRIPT_NAME="vpnmgr"
-readonly SCRIPT_VERSION="v3.2.1"
+readonly SCRIPT_VERSION="v3.2.2"
 SCRIPT_BRANCH="main"
 SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$SCRIPT_BRANCH"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
@@ -127,7 +127,7 @@ Check_Lock(){
 		fi
 	else
 		echo "$$" > "/tmp/$SCRIPT_NAME.lock"
-		trap 'Clear_Lock' INT TERM
+		trap 'Trap_Exit' INT TERM
 		return 0
 	fi
 }
@@ -135,6 +135,11 @@ Check_Lock(){
 Clear_Lock(){
 	rm -f "/tmp/$SCRIPT_NAME.lock" 2>/dev/null
 	return 0
+}
+
+Trap_Exit(){
+	Clear_Lock
+	exit 1
 }
 
 ###################################
