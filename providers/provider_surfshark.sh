@@ -120,7 +120,6 @@ remote-cert-tls server
 auth-user-pass
 
 verb 3
-fast-io
 cipher AES-256-CBC
 
 auth SHA512
