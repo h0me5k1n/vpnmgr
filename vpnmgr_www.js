@@ -628,7 +628,7 @@ function BuildConfigTable(prefix,title){
 	
 	/* SCHEDULE MODE */
 	charthtml+='<tr>';
-	charthtml+='<td class="settingname"><a class="hintstyle" href="javascript:void(0);" onclick="SettingHint(11);">Schedule Mode</a></td><td class="settingvalue"><input type="radio" onchange="ScheduleModeToggle(this)" name="'+prefix+'_schedulemode" id="'+prefix+'_schmode_everyx" class="input" value="EveryX" checked><label for="vpnmgr_'+prefix+'_schmode_everyx">Every X hours/minutes</label><input type="radio" onchange="ScheduleModeToggle(this)" name="'+prefix+'_schedulemode" id="'+prefix+'_schmode_custom" class="input" value="Custom"><label for="'+prefix+'_schmode_custom">Custom</label>';
+	charthtml+='<td class="settingname"><a class="hintstyle" href="javascript:void(0);" onclick="SettingHint(11);">Schedule Mode</a></td><td class="settingvalue"><input type="radio" onchange="ScheduleModeToggle(this)" name="'+prefix+'_schedulemode" id="'+prefix+'_schmode_everyx" class="input" value="EveryX" checked><label for="'+prefix+'_schmode_everyx">Every X hours/minutes</label><input type="radio" onchange="ScheduleModeToggle(this)" name="'+prefix+'_schedulemode" id="'+prefix+'_schmode_custom" class="input" value="Custom"><label for="'+prefix+'_schmode_custom">Custom</label>';
 	charthtml+='</tr>';
 	
 	/* SCHEDULE FREQUENCY */
