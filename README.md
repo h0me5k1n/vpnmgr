@@ -53,13 +53,19 @@ vpnmgr/
 │   └── detect.js               # LAN detection helper
 ├── providers/                  # Provider sub-scripts
 │   ├── provider_nordvpn.sh     # NordVPN — active
-│   ├── provider_pia.sh         # PIA — unmaintained
+│   ├── provider_pia.sh         # PIA — untested
+│   ├── provider_surfshark.sh   # Surfshark — API tested
 │   ├── provider_wevpn.sh       # WeVPN — deprecated
 │   └── provider_template.sh   # Template for new providers
 ├── scripts/
 │   ├── smoke-test.sh           # Local CI smoke test
-│   └── provider-test.sh        # Live API test harness for provider modules
-└── .github/workflows/ci.yml    # GitHub Actions — runs smoke-test on every PR
+│   ├── provider-test.sh        # Live API test harness for provider modules
+│   ├── api-check.sh            # Scheduled API contract check (busybox ash)
+│   ├── api-check-report.sh     # Opens/closes issues from API check results
+│   └── api-checks/             # Per-provider assertions for api-check.sh
+└── .github/workflows/
+    ├── ci.yml                  # Runs smoke-test on every PR
+    └── api-check.yml           # Daily provider API check
 ```
 
 ## Development
@@ -93,9 +99,40 @@ This exercises the live NordVPN API — country/city lookups, server recommendat
 
 Providers marked `DEPRECATED` in their `# Status:` header skip network tests automatically.
 
+### Automated API checks
+
+Provider APIs change without notice, so a scheduled workflow (`.github/workflows/api-check.yml`) checks them every day. It runs each provider file, unmodified, under busybox ash in an Alpine container — the same shell the router uses — and verifies that every endpoint still responds and still returns the fields the provider reads. Once a week, and on pull requests that touch a provider, it also builds an OpenVPN client config from the provider's output and attempts a login with fake credentials: being rejected at the login step proves the server address, port, protocol, CA certificate and TLS auth key are all correct.
+
+When a check fails for an `ACTIVE` or `API_TESTED` provider, an issue labelled `api-check` is opened with the output, and closed automatically when the check passes again.
+
+To run it yourself (requires Docker):
+
+```sh
+docker run --rm -v "$PWD:/repo:ro" alpine:3.24 sh -c \
+  'apk add -q --no-cache curl jq openssl openvpn && sh /repo/scripts/api-check.sh nordvpn --handshake'
+```
+
+It exits `0` when everything passes, `1` when an endpoint is gone or its response has changed, and `2` when the result is inconclusive (rate limited, blocked, or no response).
+
+### Provider status
+
+Each provider file declares its status on line 3:
+
+| Status | Meaning |
+|--------|---------|
+| `ACTIVE` | Connected end-to-end on a real router with a live account. Installed by default and shown in the WebUI. |
+| `API_TESTED` | Passes the automated API check including the OpenVPN handshake, but nobody has yet connected with a real account. Not installed by default. |
+| `UNTESTED` | Written but not verified. |
+| `UNMAINTAINED` | Used to work; no longer maintained. |
+| `DEPRECATED` | The provider's service is offline. |
+
+If you have an account with an `API_TESTED` provider and can confirm it connects, that is what it needs to become `ACTIVE` — see the manual testing steps in `CLAUDE.md`.
+
 ### Adding a provider
 
 Copy `providers/provider_template.sh` to `providers/provider_<name>.sh` and implement all 17 required functions. The contract is documented in the template header.
+
+Then copy `scripts/api-checks/template.sh` to `scripts/api-checks/<name>.sh` and list the response fields your provider reads. The automated API check picks the new provider up from its file name; no workflow change is needed.
 
 Run `bash scripts/smoke-test.sh` locally before opening a PR — CI enforces this on every push.
 

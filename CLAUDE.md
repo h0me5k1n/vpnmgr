@@ -21,17 +21,56 @@ repo merges jackyaz's work as the baseline and restructures it into a modular pr
 
 CI: `bash scripts/smoke-test.sh` — runs on every PR to `main` and `develop`.
 Local provider test: `bash scripts/provider-test.sh <provider>` — live API without a router.
+API check: `scripts/api-check.sh` — runs daily in CI (`.github/workflows/api-check.yml`) and on
+PRs that touch a provider. Unmodified provider files, busybox ash, live API. See below.
 
 ## Provider status
 
 Check the `# Status:` header (line 3) of each file in `providers/` — that is always the source
 of truth. Do not rely on any listing in docs.
 
-**Rule: any change to a provider resets its `# Status:` to `UNTESTED` until the change is
-verified end-to-end with a live account on a real router.**
+| Status | Meaning |
+|--------|---------|
+| `ACTIVE` | Connected end-to-end on a real router with a live account |
+| `API_TESTED` | `api-check.sh --handshake` passes in CI; never connected with a live account |
+| `UNTESTED` | Written, nothing verified |
+| `UNMAINTAINED` / `DEPRECATED` / `TEMPLATE` | See the provider-module skill |
+
+`API_TESTED` exists for providers nobody on the project has an account for. On the router it
+behaves exactly like `UNTESTED`: not installed, hidden from the WebUI, usable from the CLI if the
+file is fetched by hand. `API_TESTED` and `ACTIVE` both require `scripts/api-checks/<name>.sh`
+(the smoke test enforces this), and a PR touching a provider at either status fails if its API
+check does not pass.
+
+**Rule: any change to a provider resets its `# Status:` to `API_TESTED` if the API check passes
+on the PR, otherwise to `UNTESTED`. It returns to `ACTIVE` only once the change is verified
+end-to-end with a live account on a real router.**
 
 **Install convention:** `Install_Providers` in `vpnmgr.sh` lists only `ACTIVE` providers. When
-promoting a provider from `UNTESTED` to `ACTIVE`, add it to that loop in the same PR.
+promoting a provider to `ACTIVE`, add it to that loop in the same PR.
+
+## API check
+
+`scripts/api-check.sh <provider> [--handshake]` must run as root in a container, because it
+installs a logging shim at `/usr/sbin/curl` and writes to `/jffs/openvpn`:
+
+```sh
+docker run --rm -v "$PWD:/repo:ro" alpine:3.24 sh -c \
+  'apk add -q --no-cache curl jq openssl openvpn && sh /repo/scripts/api-check.sh nordvpn --handshake'
+```
+
+- A generic baseline runs for every provider using only the function contract, then
+  `api_check_<name>` from `scripts/api-checks/<name>.sh` adds provider-specific assertions.
+- `--handshake` builds an OpenVPN config from the values `UpdateVPNConfig` would store and the
+  files `write_certs` wrote, then expects `AUTH_FAILED` with fake credentials. This sends a
+  deliberate failed login to the provider, so it runs weekly and on PRs, not daily.
+- Exit codes: `0` pass, `1` contract broken, `2` inconclusive (403/429/5xx/no response), `3`
+  usage or environment error. NordVPN answers 403 rather than 404 for unknown paths, so a 403
+  from a host that answered other requests in the same run counts as `1`.
+- `scripts/api-check-report.sh` opens, comments on and closes issues labelled `api-check` for
+  `ACTIVE` and `API_TESTED` providers. It never edits a status header; demotion is a manual PR.
+- Scheduled workflows only run from the default branch, and GitHub disables them after 60 days
+  without repository activity.
 
 ## Technical constraints
 
@@ -86,15 +125,20 @@ vpnmgr/
 ├── providers/
 │   ├── provider_nordvpn.sh      # ACTIVE
 │   ├── provider_pia.sh          # UNTESTED
-│   ├── provider_surfshark.sh    # UNTESTED
+│   ├── provider_surfshark.sh    # API_TESTED
 │   ├── provider_wevpn.sh        # DEPRECATED
 │   └── provider_template.sh     # Template for new providers
 ├── scripts/
 │   ├── smoke-test.sh            # CI smoke tests
-│   └── provider-test.sh         # Live API test harness
+│   ├── provider-test.sh         # Live API test harness
+│   ├── api-check.sh             # Scheduled API contract check (busybox ash, container only)
+│   ├── api-check-report.sh      # Issue open/close logic for the API check workflow
+│   └── api-checks/              # Per-provider assertions + template.sh
 ├── .claude/
 │   └── commands/                # Skill files (used by Claude Code)
-├── .github/workflows/ci.yml
+├── .github/workflows/
+│   ├── ci.yml                   # Smoke test + version bump check
+│   └── api-check.yml            # Daily API check, weekly handshake
 ├── CLAUDE.md                    # This file
 └── README.md
 ```
@@ -112,7 +156,7 @@ Always read the relevant skill before starting work on that area.
 
 ## Manual provider testing on a real router
 
-To test an `UNTESTED` provider that isn't yet in the `Install_Providers` loop:
+To test an `API_TESTED` or `UNTESTED` provider that isn't yet in the `Install_Providers` loop:
 
 1. SSH to the router
 2. Fetch the provider file directly (replace `main` with your branch if testing pre-merge):
@@ -125,7 +169,7 @@ To test an `UNTESTED` provider that isn't yet in the `Install_Providers` loop:
 3. Run `vpnmgr` — the provider will appear in the slot configuration menu
 4. Test end-to-end: country/city selection, `get_server` returns a hostname, OVPN applies to
    the client slot, VPN tunnel connects, server load shows in WebUI
-5. If passing: update `# Status: UNTESTED` → `# Status: ACTIVE` in the provider file, add
+5. If passing: set `# Status: ACTIVE` in the provider file, add
    the provider name to the `Install_Providers` loop in `vpnmgr.sh`, run both test scripts,
    open a PR
 

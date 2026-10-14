@@ -1,0 +1,167 @@
+name: Provider API check
+
+# Runs every provider module, unmodified, under busybox ash against its live
+# API and opens an issue when an endpoint stops behaving as the module expects.
+# See scripts/api-check.sh.
+
+on:
+  schedule:
+    # Tuesday to Sunday: API checks only.
+    - cron: '17 5 * * 0,2-6'
+    # Monday: also attempts an OpenVPN login with fake credentials. Keep this
+    # expression in sync with HANDSHAKE below.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      handshake:
+        description: Also attempt an OpenVPN handshake with fake credentials
+        type: boolean
+        default: false
+      force_fail:
+        description: Record a deliberate failure, to test issue creation
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'providers/**'
+      - 'scripts/api-check*'
+      - 'scripts/api-checks/**'
+      - '.github/workflows/api-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    name: Find providers
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build provider matrix from status headers
+        id: matrix
+        run: |
+          matrix=$(for f in providers/provider_*.sh; do
+            name=$(basename "$f" .sh); name=${name#provider_}
+            status=$(grep -m1 '^# Status:' "$f" | awk '{print $3}')
+            case "$status" in TEMPLATE|DEPRECATED) continue ;; esac
+            printf '%s %s\n' "$name" "$status"
+          done | jq -R -s -c '[split("\n")[] | select(length > 0) | split(" ")
+            | {provider: .[0], status: .[1], secret: ("APICHECK_" + (.[0] | ascii_upcase))}]')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix" | jq .
+
+  check:
+    name: Check ${{ matrix.provider }}
+    needs: discover
+    runs-on: ubuntu-latest
+    # busybox ash and musl, as on the router. Bump deliberately.
+    container: alpine:3.24
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    env:
+      PROVIDER: ${{ matrix.provider }}
+      STATUS: ${{ matrix.status }}
+      HANDSHAKE: ${{ github.event_name == 'pull_request' || github.event.schedule == '17 5 * * 1' || inputs.handshake == true }}
+      AC_FORCE_FAIL: ${{ inputs.force_fail == true }}
+      # Optional per-provider credentials as KEY=value lines; empty for
+      # providers that need none and for pull requests from forks.
+      APICHECK_SECRETS: ${{ secrets[matrix.secret] }}
+    steps:
+      - name: Install tools
+        run: apk add --no-cache curl jq openssl openvpn
+
+      - uses: actions/checkout@v4
+
+      - name: Run API check
+        id: run
+        run: |
+          mkdir -p result
+          args=""
+          [ "$HANDSHAKE" = "true" ] && args="--handshake"
+
+          rc=0
+          sh scripts/api-check.sh "$PROVIDER" $args > result/output.txt 2>&1 || rc=$?
+
+          # One delayed retry of the whole run before anything is reported.
+          if { [ "$rc" -eq 1 ] || [ "$rc" -eq 2 ]; } && [ "$AC_FORCE_FAIL" != "true" ]; then
+            cat result/output.txt
+            echo "First attempt exited $rc — retrying in 5 minutes"
+            sleep 300
+            rc=0
+            sh scripts/api-check.sh "$PROVIDER" $args > result/output.txt 2>&1 || rc=$?
+          fi
+
+          cat result/output.txt
+          printf '%s' "$PROVIDER" > result/provider
+          printf '%s' "$STATUS" > result/status
+          printf '%s' "$rc" > result/rc
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $PROVIDER ($STATUS) — exit $rc"
+            echo '```'
+            cat result/output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The exit code is part of the artifact name so the report job can read
+      # a provider's recent history from the artifact list alone.
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.run.outputs.rc != ''
+        with:
+          name: api-check-${{ matrix.provider }}-rc${{ steps.run.outputs.rc }}
+          path: result/
+          retention-days: 30
+
+      - name: Verdict
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+        run: |
+          [ "$RC" = "0" ] && exit 0
+          case "$STATUS" in
+            ACTIVE|API_TESTED)
+              if [ "$RC" = "2" ]; then
+                echo "::warning::$PROVIDER: API check was inconclusive (blocked, rate limited or no response)"
+              else
+                echo "::error::$PROVIDER: API check failed (exit $RC)"
+              fi
+              exit 1
+              ;;
+            *)
+              echo "::warning::$PROVIDER ($STATUS): API check did not pass (exit $RC) — not gating, the provider has not been promoted"
+              ;;
+          esac
+
+  report:
+    name: Open or close issues
+    needs: [discover, check]
+    # Issues describe what routers install, so only runs on the default branch
+    # manage them. A manual run on another branch reports in its summary only.
+    if: ${{ always() && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && needs.discover.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: api-check-*
+          path: results
+
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: sh scripts/api-check-report.sh results

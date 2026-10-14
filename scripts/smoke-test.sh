@@ -48,6 +48,12 @@ while IFS= read -r -d '' f; do
     SHELL_SCRIPTS+=("${f#${REPO_ROOT}/}")
 done < <(find "${REPO_ROOT}/providers" -name '*.sh' -print0 2>/dev/null | sort -z)
 
+# The API check runs under busybox ash in CI, so it is held to the same rules.
+SHELL_SCRIPTS+=(scripts/api-check.sh scripts/api-check-report.sh)
+while IFS= read -r -d '' f; do
+    SHELL_SCRIPTS+=("${f#${REPO_ROOT}/}")
+done < <(find "${REPO_ROOT}/scripts/api-checks" -name '*.sh' -print0 2>/dev/null | sort -z)
+
 SHELLCHECK_AVAILABLE=false
 if command -v shellcheck &>/dev/null; then
     SHELLCHECK_AVAILABLE=true
@@ -180,6 +186,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # Section 6: Provider status headers
+#
+# The status must be one of the known values. API_TESTED and ACTIVE both claim
+# that the provider's API has been checked, so each needs a check spec in
+# scripts/api-checks/ for the scheduled API check to keep that claim true.
 # ---------------------------------------------------------------------------
 section "6. Provider status headers"
 
@@ -188,7 +198,25 @@ if [[ -d "${REPO_ROOT}/providers" ]]; then
         pname=$(basename "$pfile" .sh | sed 's/^provider_//')
         if grep -q '^# Status:' "$pfile"; then
             status=$(grep '^# Status:' "$pfile" | head -1 | sed 's/^# Status: *//')
-            pass "${pname}: Status: ${status}"
+            status_word=$(awk '{print $1}' <<< "$status")
+            case "$status_word" in
+                ACTIVE|API_TESTED|UNTESTED|UNMAINTAINED|DEPRECATED|TEMPLATE)
+                    pass "${pname}: Status: ${status}"
+                    ;;
+                *)
+                    fail "${pname}: unknown status '${status_word}' (expected ACTIVE, API_TESTED, UNTESTED, UNMAINTAINED, DEPRECATED or TEMPLATE)"
+                    ;;
+            esac
+            case "$status_word" in
+                ACTIVE|API_TESTED)
+                    if [[ -f "${REPO_ROOT}/scripts/api-checks/${pname}.sh" ]] \
+                        && grep -q "^api_check_${pname}(){" "${REPO_ROOT}/scripts/api-checks/${pname}.sh"; then
+                        pass "${pname}: has API check spec (required for ${status_word})"
+                    else
+                        fail "${pname}: status ${status_word} requires scripts/api-checks/${pname}.sh defining api_check_${pname}()"
+                    fi
+                    ;;
+            esac
         else
             fail "${pname}: missing '# Status:' header"
         fi

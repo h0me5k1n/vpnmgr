@@ -1,6 +1,6 @@
 #!/bin/sh
 # Provider: Surfshark
-# Status: UNTESTED
+# Status: API_TESTED
 # Display: Surfshark
 # Config: Surfshark
 # Description: Surfshark VPN — 100 countries, 142 server locations.

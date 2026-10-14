@@ -10,6 +10,9 @@
 #
 # Status values (line 3 of every provider file — read by scripts/provider-test.sh):
 #   ACTIVE       — provider is maintained and its API is operational
+#   API_TESTED   — API and OpenVPN handshake verified by scripts/api-check.sh;
+#                  not yet connected with a live account
+#   UNTESTED     — implementation complete but nothing verified
 #   UNMAINTAINED — provider was functional but is no longer actively maintained
 #   DEPRECATED   — provider service is offline; only static tests run
 #   TEMPLATE     — not a real provider; provider-test.sh will exit immediately

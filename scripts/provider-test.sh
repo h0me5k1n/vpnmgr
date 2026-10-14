@@ -80,6 +80,11 @@ case "$STATUS" in
         echo ""
         NETWORK_TESTS=false
         ;;
+    API_TESTED)
+        _warn "Provider is API_TESTED — API and handshake verified in CI, not yet connected with a live account"
+        echo ""
+        NETWORK_TESTS=true
+        ;;
     UNTESTED)
         _warn "Provider is UNTESTED — implementation not yet verified on a live account"
         _warn "API tests will run; failures may indicate config errors rather than API changes"
