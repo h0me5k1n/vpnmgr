@@ -99,6 +99,18 @@ Firmware_Number_Check(){
 	echo "$1" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'
 }
 
+Firmware_Build_Before(){
+	# Legacy thresholds refer to the 3.0.0.4 family. Newer families restarted
+	# build numbering (3.0.0.6 uses 102.x); absent/unknown families keep the
+	# previous build-only comparison for compatibility.
+	_fbb_family="$(nvram get firmver)"
+	if printf '%s\n' "$_fbb_family" | grep -Eq '^[0-9]+(\.[0-9]+){3}$' &&
+		[ "$(Firmware_Number_Check "$_fbb_family")" -gt "$(Firmware_Number_Check 3.0.0.4)" ]; then
+		return 1
+	fi
+	[ "$(Firmware_Number_Check "$(nvram get buildno)")" -lt "$(Firmware_Number_Check "$1")" ]
+}
+
 OpenVPN_Version_Number(){
 	# Echoes the router's OpenVPN version as a zero-padded integer for numeric
 	# comparison (e.g. 2007000 for 2.7.0). Empty if openvpn is missing or unparseable.
@@ -496,7 +508,8 @@ Get_WebUI_URL(){
 	urldomain=""
 	urlport=""
 
-	urlpage="$(sed -nE "/$SCRIPT_NAME/ s/.*url\: \"(user[0-9]+\.asp)\".*/\1/p" /tmp/menuTree.js)"
+	# Read the served tree; the /tmp working copy can differ from the active mount.
+	urlpage="$(sed -nE "/$SCRIPT_NAME/ s/.*url\: \"(user[0-9]+\.asp)\".*/\1/p" /www/require/modules/menuTree.js)"
 	if [ "$(nvram get http_enable)" -eq 1 ]; then
 		urlproto="https"
 	else
@@ -1295,9 +1308,9 @@ UpdateVPNConfig(){
 	if [ -z "$(nvram get vpn_client"$VPN_NO"_addr)" ]; then
 		nvram set vpn_client"$VPN_NO"_adns=3
 		nvram set vpn_client"$VPN_NO"_enforce=1
-		if [ "$(Firmware_Number_Check "$(nvram get buildno)")" -lt "$(Firmware_Number_Check 384.18)" ]; then
+		if Firmware_Build_Before 384.18; then
 			nvram set vpn_client"$VPN_NO"_clientlist="<DummyVPN>172.16.14.1>0.0.0.0>VPN"
-		elif [ "$(Firmware_Number_Check "$(nvram get buildno)")" -lt "$(Firmware_Number_Check 386.3)" ]; then
+		elif Firmware_Build_Before 386.3; then
 			nvram set vpn_client"$VPN_NO"_clientlist="<DummyVPN>172.16.14.1>>VPN"
 		fi
 		if ! nvram get vpn_clientx_eas | grep -q "$VPN_NO"; then
@@ -1334,7 +1347,7 @@ UpdateVPNConfig(){
 	VPN_HMAC="$("provider_${VPN_PROVIDER_LC}_get_hmac")"
 	nvram set vpn_client"$VPN_NO"_hmac="$VPN_HMAC"
 
-	if [ "$(Firmware_Number_Check "$(nvram get buildno)")" -lt "$(Firmware_Number_Check 384.19)" ]; then
+	if Firmware_Build_Before 384.19; then
 		nvram set vpn_client"$VPN_NO"_connretry="-1"
 	else
 		nvram set vpn_client"$VPN_NO"_connretry=0
@@ -2156,7 +2169,7 @@ tun-mtu-extra 32
 mssfix 1450"
 	fi
 	
-	if [ "$(Firmware_Number_Check "$(nvram get buildno)")" -lt "$(Firmware_Number_Check 386.3)" ]; then
+	if Firmware_Build_Before 386.3; then
 		vpncustomoptionsbase64="$(echo "$vpncustomoptions" | head -c -1 | openssl base64 -A)"
 		
 		if [ "$(/bin/uname -m)" = "aarch64" ]; then

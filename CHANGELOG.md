@@ -11,6 +11,21 @@ there). At release it is renamed to the version and date. Never leave an
 empty "## Unreleased" heading; the smoke test rejects one.
 -->
 
+## Unreleased
+
+### Fixed
+
+- **Merlin WebUI initialization:** load `httpApi.js` before `client_function.js` to fix the partially rendered VPN Manager page and `httpApi is not defined` errors. Remove the obsolete `tmhist.js` and `tmmenu.js` includes that return 404 on newer firmware. (#62)
+- **Merlin 3006 VPN setup:** check the firmware family before comparing legacy build numbers, so `3006.102.9` is not treated as older than the `384.x`/`386.x` releases. Set Connection Retry attempts to `0` instead of invalid `-1` and avoid obsolete routing defaults. Preserve the existing version boundaries for older firmware. (#62)
+- **Managed OpenVPN custom options:** regenerate VPNMgr's managed options in the active per-client `custom3` file on Merlin 3006 when custom settings are enabled. This prevents stale imported server-name restrictions from blocking server changes while retaining CA validation and `remote-cert-tls server`. User-managed custom options remain unchanged when VPNMgr custom settings are disabled. (#62)
+- **CLI WebUI URL:** read Merlin's active menu tree to resolve the registered page number, preventing false `WebUI page not found` messages or outdated links when the temporary menu copy differs from the active menu. (#62)
+
+Verified on ASUS RT-BE88U with Merlin `3006.102.9` and GT-AX11000 with Merlin `388.12_2`.
+
+### Repository
+
+- Add offline regression tests for firmware-family routing, retry and custom-options behavior, including imported server-name restrictions and disabled custom settings, plus active-menu CLI URL discovery. (#62)
+
 ## v3.4.0 (2026-10-18)
 
 ### Added
