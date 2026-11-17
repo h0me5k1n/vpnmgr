@@ -2953,6 +2953,8 @@ MainMenu(){
 			;;
 			7)
 				printf "\\n"
+				ScriptHeader
+				ListVPNClients false hide
 				printf "Please enter VPN client number(s) (e.g. 3, 1-5, or 1,4,2 - 'e' to cancel):  "
 				_menu7_cancel="false"
 				while true; do

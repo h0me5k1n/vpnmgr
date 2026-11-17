@@ -18,11 +18,20 @@ if [ "$TEST_OS" = "Darwin" ]; then
 	fi
 fi
 
-for test_fn in Validate_Number ParseSlotSelection SetVPNCustomSettings \
+for test_fn in Validate_Number ParseSlotSelection ListVPNClients SetVPNCustomSettings \
 	Write_VPNCustomOptions Toggle_VPN_Custom_Settings; do
 	sed -n "/^${test_fn}(){/,/^}/p" "$REPO_ROOT/vpnmgr.sh"
 done | sed "s|/jffs/openvpn/|\"\$TEST_DIR\"/openvpn/|g" > "$TEST_DIR/functions.sh"
 . "$TEST_DIR/functions.sh"
+
+# Exercise the actual menu consumer, without the main menu's recursive loop or
+# any router startup/dispatcher code. Its break statements retain a loop target.
+{
+	printf 'Run_Menu7(){\nwhile :; do\n'
+	sed -n '/^[[:space:]]*7)/,/^[[:space:]]*;;/p' "$REPO_ROOT/vpnmgr.sh" | sed '1d;$d'
+	printf 'done\n}\n'
+} > "$TEST_DIR/menu7.sh"
+. "$TEST_DIR/menu7.sh"
 
 # Use the installed sed implementation. Adapt only BSD sed's -i syntax when
 # GNU sed is unavailable; Linux and BusyBox use their native -i behavior.
@@ -44,6 +53,15 @@ state_is(){
 Print_Output(){ printf '%s\n' "$2" >> "$TEST_DIR/messages"; }
 Validate_Number(){ case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 Firmware_Build_Before(){ return 1; }
+ScriptHeader(){ :; }
+PressEnter(){ :; }
+getConnectState(){ printf '0\n'; }
+nvram(){
+	case "$1:$2" in
+		get:vpn_client[1-5]_desc) printf 'Fixture %s\n' "$2" ;;
+		*) die "unexpected nvram access: $1 $2" ;;
+	esac
+}
 Detect_OpenVPN_Runtime(){
 	OVPN_RUNTIME_VERSION="$TEST_RUNTIME_VERSION"
 	OVPN_RUNTIME_NUMBER="$TEST_RUNTIME_NUMBER"
@@ -55,6 +73,9 @@ SCRIPT_CONF="$TEST_DIR/config"
 PASS="PASS"
 WARN="WARN"
 ERR="ERR"
+BOLD=''
+CLEARFORMAT=''
+SETTING=''
 cat > "$SCRIPT_CONF" <<'EOF'
 vpn1_managed=true
 vpn1_customsettings=false
@@ -80,6 +101,8 @@ vpn4_provider=Surfshark
 vpn4_protocol=UDP
 vpn4_mute=
 vpn4_debugverb=true
+vpn5_managed=false
+vpn5_customsettings=false
 EOF
 
 # 2.5 uses legacy UDP settings and retains persist-key. Caller globals are stale.
@@ -141,18 +164,33 @@ Toggle_VPN_Custom_Settings 4
 state_is 4 false
 cmp -s "$TEST_DIR/before-disable" "$TEST_DIR/openvpn/vpn_client4_custom3" || die 'disable changed options block'
 
-# The existing parser deduplicates batch selection; unmanaged and unselected
+# Choice 7 must show the eligible clients and their custom-setting states before
+# asking for a selection. Cancellation and invalid-input retry leave data alone.
+cp "$SCRIPT_CONF" "$TEST_DIR/before-cancel"
+Run_Menu7 > "$TEST_DIR/menu7-output" <<'EOF'
+invalid
+e
+EOF
+grep -q '^VPN client list:' "$TEST_DIR/menu7-output" || die 'Choice 7 omitted client list'
+for _listed_slot in 1 3 4; do
+	grep -q "^$_listed_slot\.    Fixture vpn_client${_listed_slot}_desc" "$TEST_DIR/menu7-output" || die "Choice 7 omitted managed client $_listed_slot"
+done
+if grep -q 'Fixture vpn_client[25]_desc' "$TEST_DIR/menu7-output"; then die 'Choice 7 listed unmanaged clients'; fi
+grep -q 'Uncustomised' "$TEST_DIR/menu7-output" || die 'Choice 7 omitted custom-setting state'
+grep -q 'Please enter a valid slot number' "$TEST_DIR/menu7-output" || die 'Choice 7 skipped invalid-input retry'
+_menu7_list_line="$(grep -n '^VPN client list:' "$TEST_DIR/menu7-output" | cut -d: -f1)"
+_menu7_prompt_line="$(grep -n 'Please enter VPN client number(s)' "$TEST_DIR/menu7-output" | head -n 1 | cut -d: -f1)"
+[ "$_menu7_list_line" -lt "$_menu7_prompt_line" ] || die 'Choice 7 prompted before listing clients'
+cmp -s "$SCRIPT_CONF" "$TEST_DIR/before-cancel" || die 'Choice 7 cancellation changed settings'
+
+# The real menu/parser deduplicates batch selection; unmanaged and unselected
 # slots stay untouched while selected managed slots toggle once.
-ParseSlotSelection '1,2-3,2' || die 'batch input rejected'
-[ "$GLOBAL_VPN_SLOTS" = '1 2 3' ] || die "unexpected parsed slots: $GLOBAL_VPN_SLOTS"
 printf 'prior custom options\n' > "$TEST_DIR/openvpn/vpn_client3_custom3"
 cp "$TEST_DIR/openvpn/vpn_client3_custom3" "$TEST_DIR/slot3-before"
-for _batch_slot in $GLOBAL_VPN_SLOTS; do
-	_batch_managed="$(grep "^vpn${_batch_slot}_managed=" "$SCRIPT_CONF" | cut -d= -f2)"
-	if [ "$_batch_managed" = "true" ]; then
-		Toggle_VPN_Custom_Settings "$_batch_slot" || die "batch toggle failed for slot $_batch_slot"
-	fi
-done
+Run_Menu7 > "$TEST_DIR/menu7-batch-output" <<'EOF'
+1,2-3,2,3
+EOF
+[ "$GLOBAL_VPN_SLOTS" = '1 2 3' ] || die "unexpected parsed slots: $GLOBAL_VPN_SLOTS"
 state_is 1 true
 state_is 2 false
 state_is 3 false
