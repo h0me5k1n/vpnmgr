@@ -1,5 +1,8 @@
 # vpnmgr — Claude Code Project Guide
 
+This is repository contributor guidance. The code and committed test commands
+described here can be used without Claude Code or private test helpers.
+
 ## What this is
 
 **vpnmgr** is a VPN client management tool for AsusWRT-Merlin routers. It manages up to five
@@ -19,7 +22,9 @@ repo merges jackyaz's work as the baseline and restructures it into a modular pr
 | 4 — WebUI | ⏸ Deferred | shared-jy dependency removed; full modernisation pending |
 | 5 — Documentation | ✅ Done | README rewritten |
 
-CI: `bash scripts/smoke-test.sh` — runs on every PR to `main` and `develop`.
+CI: `.github/workflows/ci.yml` runs smoke, JavaScript contracts and isolated
+BusyBox fixtures on PRs/pushes to `main` and `develop`, and by manual dispatch
+for feature branches. Its release-version gate applies only to PRs into `main`.
 Local provider test: `bash scripts/provider-test.sh <provider>` — live API without a router.
 API check: `scripts/api-check.sh` — runs daily in CI (`.github/workflows/api-check.yml`) and on
 PRs that touch a provider. Unmodified provider files, busybox ash, live API. See below.
@@ -134,10 +139,10 @@ vpnmgr/
 ├── vpnmgr.sh                    # Core — CLI, scheduler, VPN client control, self-update
 ├── vpnmgr_www.asp               # WebUI page (AsusWRT-Merlin Addons API)
 ├── vpnmgr_www.js                # WebUI logic
-├── vpnmgr_www.css               # WebUI styles
+├── vpnmgr_www.css               # Legacy styles; current page uses inline CSS
 ├── www/                         # Bundled web assets
 ├── providers/
-│   ├── provider_nordvpn.sh      # ACTIVE
+│   ├── provider_nordvpn.sh      # UNTESTED; development visibility is separate
 │   ├── provider_pia.sh          # API_TESTED
 │   ├── provider_surfshark.sh    # API_TESTED
 │   ├── provider_wevpn.sh        # DEPRECATED
@@ -152,7 +157,7 @@ vpnmgr/
 ├── .claude/
 │   └── commands/                # Skill files (used by Claude Code)
 ├── .github/workflows/
-│   ├── ci.yml                   # Smoke test + version bump check
+│   ├── ci.yml                   # Smoke, JS/BusyBox contracts + release-version gate
 │   ├── api-check.yml            # Daily API check, weekly handshake
 │   └── release.yml              # Tags + publishes a GitHub release on version change
 ├── CHANGELOG.md                 # Per-release changes; "Unreleased" only while it has entries
@@ -179,7 +184,7 @@ To test an `API_TESTED` or `UNTESTED` provider that isn't yet in the `Install_Pr
 2. Fetch the provider file directly (replace `main` with your branch if testing pre-merge):
    ```sh
    /usr/sbin/curl -fsL --retry 3 \
-     "https://raw.githubusercontent.com/h0me5k1n/asusmerlin-nvpnmgr/main/providers/provider_<name>.sh" \
+     "https://raw.githubusercontent.com/h0me5k1n/vpnmgr/main/providers/provider_<name>.sh" \
      -o "/jffs/addons/vpnmgr.d/providers/provider_<name>.sh"
    chmod 0755 "/jffs/addons/vpnmgr.d/providers/provider_<name>.sh"
    ```

@@ -1,5 +1,10 @@
 # Bootstrap: Fork Merge & Restructure
 
+This is the historical fork-revival plan. Its phase commands are not the current
+development or installation procedure. See [CLAUDE.md](../../CLAUDE.md),
+[core-script.md](core-script.md) and [webui.md](webui.md) for current source,
+update and validation behavior.
+
 ## Context
 
 You are helping revive the `vpnmgr` project. The upstream fork by jackyaz (https://github.com/jackyaz/vpnmgr, now archived) is the true baseline — it has 429 commits of improvements over the original h0me5k1n/asusmerlin-nvpnmgr repo.

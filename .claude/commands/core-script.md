@@ -201,41 +201,28 @@ Refresh_VPN_Client() {
 
 ### Self-Update Flow
 
-```sh
-SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/vpnmgr/master"
-SCRIPT_NAME="vpnmgr"
+Use the existing source-selection functions rather than constructing a second
+download URL. `Pin_Script_Repo` resolves the selected repository/branch to one
+revision. `Bootstrap_Install` verifies/refetches the main script at that revision
+before installation; providers and WebUI/supporting files use the same source.
 
-Update_Check() {
-    local localver serverver
-
-    localver=$(grep "SCRIPT_VERSION=" "/jffs/scripts/$SCRIPT_NAME" \
-        | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')
-
-    # Integrity check — verify we're downloading from the right repo
-    /usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" \
-        | grep -qF "h0me5k1n" || {
-        Print_Output true "404 error detected - stopping update" "$ERR"
-        return 1
-    }
-
-    serverver=$(/usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" \
-        | grep "SCRIPT_VERSION=" \
-        | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')
-
-    # Compare and update...
-}
-```
+`Update_Check` downloads a validated candidate once, compares version/content,
+and also detects changed source identity. `.install_revision` identifies the
+installed script source; `.files_source` is recorded only after asset refresh
+succeeds. A failed refresh must remain retryable. Preserve source metadata when
+re-executing an update and retain the normal branch-switching commands.
 
 ## Version Bumping (REQUIRED)
 
 `SCRIPT_VERSION` is defined at the top of `vpnmgr.sh` (`readonly SCRIPT_VERSION="vX.Y.Z"`).
 
-**Bump it whenever you change:**
+**These files count as router-delivered changes for release versioning:**
 - `vpnmgr.sh` itself
 - Any `providers/provider_*.sh` file
 - `vpnmgr_www.asp`, `vpnmgr_www.js`, or anything under `www/`
 
-Routers only see an update when `SCRIPT_VERSION` (or the md5 of `vpnmgr.sh`) changes, so a change to any other delivered file without a bump never reaches existing installs.
+Pinned-source installs and updates can refresh changed assets even when
+`SCRIPT_VERSION` is unchanged. That mechanism does not replace release versioning.
 
 The bump happens once per release, on `develop`, before the PR from `develop` into `main`, together with renaming `## Unreleased` in `CHANGELOG.md` to the new version (see `CLAUDE.md`, Branch workflow). CI enforces it there: the `version-bump` job in `.github/workflows/ci.yml` will fail a PR into `main` if router-delivered files changed but the version didn't. Follow semver:
 
@@ -260,7 +247,7 @@ The bump happens once per release, on `develop`, before the PR from `develop` in
 
 ### Testing changes
 
-Two test scripts exist:
+Use the committed checks appropriate to the changed behavior:
 
 ```sh
 # CI smoke test — validates all provider contracts, sourcing, and function presence.
@@ -273,7 +260,16 @@ bash scripts/provider-test.sh nordvpn
 bash scripts/provider-test.sh pia
 ```
 
-The core script itself has no dedicated unit test harness. For `vpnmgr.sh` changes:
-- Use `Print_Output` liberally for debug tracing during development
-- Check syntax with `sh -n vpnmgr.sh` (or `shellcheck -s sh vpnmgr.sh` for full analysis)
-- Test on router via SCP: `scp vpnmgr.sh admin@router:/jffs/scripts/vpnmgr`
+Offline fixtures cover runtime detection, presets/Choice 7, profile validation,
+backend requests, pinned-source installation/downloads and banner rendering:
+`scripts/openvpn-runtime-test.sh`, `openvpn-presets-test.sh`,
+`api-profile-test.sh`, `webui-backend-test.sh`, `source-download-test.sh`,
+`install-source-test.sh` and `banner-test.sh`. Run them with `sh`; CI also runs
+them under BusyBox ash. The banner's `--busybox` mode requires BusyBox. On macOS,
+the install-source fixture requires GNU-compatible `sed` on its process `PATH`.
+
+Check shell syntax/lint and use the committed JavaScript/browser checks described
+in [webui.md](webui.md) for UI changes. These fixtures do not prove native router
+configuration, real-account authentication or tunnel traffic. Live installation,
+settings changes, file copies and restarts require the operator's explicit scope;
+record the installed/served revision separately from local or simulated results.
