@@ -588,6 +588,7 @@ SCRIPT_BRANCH_OVERRIDE=""
 SCRIPT_REVISION=""
 SCRIPT_SOURCE_FILE="${_IS_DIR}/.install_source"
 SCRIPT_SOURCE_REVISION_FILE="${_IS_DIR}/.install_revision"
+WARN=""; ERR=""
 _IS_SETTINGS="${_IS_DIR}/custom_settings.txt"
 _IS_REPLY=""
 _is_curl() { printf '%s' "$_IS_REPLY"; }

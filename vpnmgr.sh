@@ -296,6 +296,7 @@ Load_Installed_Source(){
 
 Resolve_Installed_Source(){
 	if Load_Installed_Source; then return 0; fi
+	[ -z "${VPNMGR_INSTALL_SHA:-}" ] || return 1
 	# A test bootstrap must provide its already-resolved SHA, never resolve again.
 	[ -z "$SCRIPT_BRANCH_OVERRIDE" ] || {
 		Print_Output true "Missing exact test-build revision; install using VPNMGR_INSTALL_SHA" "$ERR"
@@ -384,6 +385,13 @@ Update_Check(){
 			echo 'var updatestatus = "'"$serverver-hotfix"'";'  > "$SCRIPT_WEB_DIR/detect_update.js"
 		fi
 	fi
+	if [ "$doupdate" = "false" ] && [ -n "$SCRIPT_REVISION" ] &&
+		{ [ "$(cat "$SCRIPT_SOURCE_REVISION_FILE" 2>/dev/null)" != "$(Script_Source_Identity)" ] ||
+		  [ "$(cat "$SCRIPT_FILES_SOURCE" 2>/dev/null)" != "$(Script_Source_Identity)" ]; }; then
+		doupdate="source"
+		Set_Version_Custom_Settings server "$serverver-hotfix"
+		echo 'var updatestatus = "'"$serverver-hotfix"'";' > "$SCRIPT_WEB_DIR/detect_update.js"
+	fi
 	if [ "$doupdate" = "false" ]; then
 		echo 'var updatestatus = "None";'  > "$SCRIPT_WEB_DIR/detect_update.js"
 	fi
@@ -406,6 +414,8 @@ Update_Version(){
 			Print_Output true "New version of $SCRIPT_NAME available - $serverver" "$PASS"
 		elif [ "$isupdate" = "md5" ]; then
 			Print_Output true "MD5 hash of $SCRIPT_NAME does not match - hotfix available $serverver" "$PASS"
+		elif [ "$isupdate" = "source" ]; then
+			Print_Output true "A different source revision of $SCRIPT_NAME is available - hotfix $serverver" "$PASS"
 		fi
 		
 		if [ "$isupdate" != "false" ]; then
@@ -1357,7 +1367,7 @@ Create_Symlinks(){
 	done
 	ln -s "$SCRIPT_DIR/providers_list" "$SCRIPT_WEB_DIR/providers.htm" 2>/dev/null
 
-	cp -f "$SCRIPT_DIR/vpnmgr_www.js" "$SCRIPT_WEB_DIR/vpnmgr_www.js" 2>/dev/null
+	cp -f "$SCRIPT_DIR/vpnmgr_www.js" "$SCRIPT_WEB_DIR/vpnmgr_www.js" 2>/dev/null || return 1
 
 	Runtime_Init && ln -s "$VPNMGR_RUNTIME_DIR" "$SCRIPT_WEB_DIR/runtime" 2>/dev/null || return 1
 
@@ -3203,6 +3213,10 @@ Menu_Install(){
 		exit 1
 	fi
 	
+	# Mark this installation as ours before creating the providers directory,
+	# so a failed first download can be retried without looking like legacy.
+	mkdir -p "$SCRIPT_DIR" || return 1
+	[ -f "$SCRIPT_DIR/providers_list" ] || : > "$SCRIPT_DIR/providers_list" || return 1
 	Create_Dirs
 	Conf_Exists
 	Configure_Test_Providers || return 1
@@ -3400,10 +3414,10 @@ if [ -z "$1" ]; then
 	Auto_Startup create 2>/dev/null
 	Auto_ServiceEvent create 2>/dev/null
 	Shortcut_Script create
-	Sync_Addon_Files
+	Sync_Addon_Files || exit 1
 	Refresh_Provider_Cache
 
-	Create_Symlinks
+	Create_Symlinks || exit 1
 	ScriptHeader
 	MainMenu
 	exit 0
@@ -3414,7 +3428,9 @@ case "$1" in
 		Select_Install_Source || exit 1
 		Check_Lock
 		Menu_Install
-		exit $?
+		_install_rc=$?
+		Clear_Lock
+		exit "$_install_rc"
 	;;
 	updatevpn)
 		NTP_Ready
@@ -3480,10 +3496,10 @@ case "$1" in
 			mv /tmp/vpnmgrserverloads.tmp /tmp/vpnmgrserverloads
 		elif [ "$2" = "start" ] && [ "$3" = "${SCRIPT_NAME}checkupdate" ]; then
 			Update_Check
-			exit 0
+			exit $?
 		elif [ "$2" = "start" ] && [ "$3" = "${SCRIPT_NAME}doupdate" ]; then
-			Update_Version force
-			exit 0
+			Update_Version force unattended
+			exit $?
 		fi
 		exit 0
 	;;
@@ -3511,7 +3527,7 @@ case "$1" in
 		Shortcut_Script create
 		Sync_Addon_Files || exit 1
 		Refresh_Provider_Cache
-		Create_Symlinks
+		Create_Symlinks || exit 1
 		exit 0
 	;;
 	postupdate)
@@ -3528,7 +3544,7 @@ case "$1" in
 		Shortcut_Script create
 		Sync_Addon_Files || exit 1
 		Refresh_Provider_Cache
-		Create_Symlinks
+		Create_Symlinks || exit 1
 		exit 0
 	;;
 	about)
