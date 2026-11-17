@@ -109,14 +109,21 @@ _nordvpn_get_city(){
 		| jq -r -e "[ .[] | select(.locations[].country.city.id==${_nc_cityid})][0] // empty"
 }
 
-# provider_nordvpn_get_ovpn hostname protocol vpn_type
+# provider_nordvpn_get_ovpn hostname protocol vpn_type [legacy|modern]
 # Downloads OVPN file from NordVPN CDN and prints contents to stdout.
+# The core passes its detected family explicitly. Independent consumers keep
+# the historical legacy route unless they explicitly request modern profiles.
 provider_nordvpn_get_ovpn(){
 	_gov_hostname="$1"
 	_gov_prot="$2"
 	_gov_prot_lc="$(printf '%s' "$_gov_prot" | tr 'A-Z' 'a-z')"
+	case "${4:-legacy}" in
+		legacy) _gov_suffix="" ;;
+		modern) _gov_suffix="_2.6" ;;
+		*) return 1 ;;
+	esac
 	/usr/sbin/curl -fsL --retry 3 \
-		"https://downloads.nordcdn.com/configs/files/ovpn_${_gov_prot_lc}/servers/${_gov_hostname}.${_gov_prot_lc}.ovpn"
+		"https://downloads.nordcdn.com/configs/files/ovpn_${_gov_prot_lc}/servers/${_gov_hostname}.${_gov_prot_lc}${_gov_suffix}.ovpn"
 }
 
 # provider_nordvpn_get_comp

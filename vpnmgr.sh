@@ -111,11 +111,43 @@ Firmware_Build_Before(){
 	[ "$(Firmware_Number_Check "$(nvram get buildno)")" -lt "$(Firmware_Number_Check "$1")" ]
 }
 
+Parse_OpenVPN_Version(){
+	# A missing patch is zero; vendor/prerelease suffixes do not affect the
+	# numeric family. Reject malformed tokens instead of coercing them to zero.
+	printf '%s\n' "$1" | awk 'NR==1 {
+		if ($1 != "OpenVPN" || $2 !~ /^[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][[:alnum:]][[:alnum:].+_-]*)?$/) exit 1;
+		split($2,core,/[-+_]/); n=split(core[1],v,".");
+		if (v[1]<2 || v[1]>99 || v[2]>999 || (n==3 && v[3]>999)) exit 1;
+		printf "%s|%d%03d%03d|%s\n", $2,v[1],v[2],(n==3?v[3]:0),
+			(v[1]>2 || (v[1]==2 && v[2]>=6) ? "modern" : "legacy");
+		exit;
+	}'
+}
+
+Detect_OpenVPN_Runtime(){
+	OVPN_RUNTIME_VERSION=""
+	OVPN_RUNTIME_NUMBER=""
+	OVPN_RUNTIME_FAMILY="legacy"
+	OVPN_RUNTIME_STATUS="unknown"
+	# Merlin starts this executable, independently of Entware's PATH and of
+	# whether any VPN client is currently running. Keep its exit status.
+	if [ -x "/usr/sbin/openvpn" ] &&
+		_ovr_banner="$("/usr/sbin/openvpn" --version 2>/dev/null)" &&
+		_ovr_info="$(Parse_OpenVPN_Version "$_ovr_banner")" && [ -n "$_ovr_info" ]; then
+		OVPN_RUNTIME_VERSION="${_ovr_info%%|*}"
+		_ovr_info="${_ovr_info#*|}"
+		OVPN_RUNTIME_NUMBER="${_ovr_info%%|*}"
+		OVPN_RUNTIME_FAMILY="${_ovr_info#*|}"
+		OVPN_RUNTIME_STATUS="detected"
+	else
+		Print_Output true "Built-in OpenVPN version is unavailable or invalid; using legacy profiles and settings" "$WARN" >&2
+	fi
+	return 0
+}
+
 OpenVPN_Version_Number(){
-	# Echoes the router's OpenVPN version as a zero-padded integer for numeric
-	# comparison (e.g. 2007000 for 2.7.0). Empty if openvpn is missing or unparseable.
-	openvpn --version 2>/dev/null | awk 'NR==1 && $1=="OpenVPN" {
-		n=split($2,v,"."); printf("%d%03d%03d\n", v[1], v[2], (n>2?v[3]:0)); exit }'
+	Detect_OpenVPN_Runtime
+	[ -n "$OVPN_RUNTIME_NUMBER" ] && printf '%s\n' "$OVPN_RUNTIME_NUMBER"
 }
 
 ### Code for these functions inspired by https://github.com/Adamm00 - credit to @Adamm ###
@@ -1263,6 +1295,7 @@ UpdateVPNConfig(){
 	VPN_CITYID="$(grep "vpn${VPN_NO}_cityid" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	VPN_CITYNAME="$(grep "vpn${VPN_NO}_cityname" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	OVPN_ADDR=""
+	Detect_OpenVPN_Runtime
 
 	Load_Provider "$VPN_PROVIDER_LC" || return 1
 
@@ -1274,7 +1307,7 @@ UpdateVPNConfig(){
 		"$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")"
 	[ -z "$OVPN_HOSTNAME" ] && Print_Output true "Could not determine server identifier for VPN client $VPN_NO" "$ERR" && return 1
 
-	OVPN_DETAIL="$("provider_${VPN_PROVIDER_LC}_get_ovpn" "$OVPN_HOSTNAME" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")" || {
+	OVPN_DETAIL="$("provider_${VPN_PROVIDER_LC}_get_ovpn" "$OVPN_HOSTNAME" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT" "$OVPN_RUNTIME_FAMILY")" || {
 		Print_Output true "Error retrieving VPN server ovpn file" "$ERR"
 		return 1
 	}
@@ -1430,7 +1463,10 @@ UpdateVPNConfig(){
 	fi
 
 	if [ "$(grep "vpn${VPN_NO}_customsettings" "$SCRIPT_CONF" | cut -f2 -d"=")" = "true" ]; then
-		SetVPNCustomSettings "$VPN_NO"
+		SetVPNCustomSettings "$VPN_NO" "$OVPN_RUNTIME_FAMILY" "$OVPN_RUNTIME_NUMBER" "$OVPN_DETAIL" || {
+			Print_Output true "Error writing custom OpenVPN options for VPN client $VPN_NO" "$ERR"
+			return 1
+		}
 	else
 		Strip_Stale_X509Name "$VPN_NO"
 	fi
@@ -2199,7 +2235,35 @@ SetScheduleParameters(){
 
 SetVPNCustomSettings(){
 	VPN_NO="$1"
-	vpncustomoptions='remote-random
+	# Caller globals may describe another slot; always read anchored values here.
+	VPN_PROVIDER="$(grep "^vpn${VPN_NO}_provider=" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	VPN_PROVIDER_LC="$(printf '%s' "$VPN_PROVIDER" | tr 'A-Z' 'a-z')"
+	VPN_PROT_SHORT="$(grep "^vpn${VPN_NO}_protocol=" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	case "$VPN_PROT_SHORT" in
+		UDP|udp) VPN_PROT_SHORT="UDP" ;;
+		TCP|tcp) VPN_PROT_SHORT="TCP" ;;
+		*)
+			Print_Output true "Cannot determine protocol for VPN client $VPN_NO custom settings" "$ERR"
+			return 1
+		;;
+	esac
+
+	# Signature: slot [family version_number [profile]]. Refreshes pass the
+	# operation snapshot; direct menu calls detect afresh. Profile text alone
+	# cannot establish whether effective traffic shaping is enabled.
+	if [ "$#" -ge 3 ]; then
+		OVPN_RUNTIME_FAMILY="$2"
+		OVPN_RUNTIME_NUMBER="$3"
+	else
+		Detect_OpenVPN_Runtime
+	fi
+	case "$OVPN_RUNTIME_FAMILY" in modern) VPN_CUSTOM_FAMILY="modern" ;; *) VPN_CUSTOM_FAMILY="legacy" ;; esac
+	VPN_OVPNVER="$OVPN_RUNTIME_NUMBER"
+	VPN_MUTE="$(grep "^vpn${VPN_NO}_mute=" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	[ -z "$VPN_MUTE" ] && VPN_MUTE="20"
+	VPN_DEBUGVERB="$(grep "^vpn${VPN_NO}_debugverb=" "$SCRIPT_CONF" | cut -f2 -d"=")"
+
+	VPN_CUSTOM_SHARED='remote-random
 resolv-retry infinite
 remote-cert-tls server
 ping-timer-rem
@@ -2212,41 +2276,61 @@ pull-filter ignore "auth-token"
 pull-filter ignore "ifconfig-ipv6"
 pull-filter ignore "route-ipv6"
 auth-nocache'
-
-	# persist-key and fast-io are ignored no-ops from OpenVPN 2.6 onwards (key
-	# persistence is automatic, fast-io was removed). Only add them for older clients.
-	VPN_OVPNVER="$(OpenVPN_Version_Number)"
-	if [ -z "$VPN_OVPNVER" ] || [ "$VPN_OVPNVER" -lt 2006000 ]; then
-		vpncustomoptions="$vpncustomoptions
-persist-key
-fast-io"
+	VPN_CUSTOM_LEGACY_SHARED="$VPN_CUSTOM_SHARED"
+	VPN_CUSTOM_MODERN_SHARED="$VPN_CUSTOM_SHARED"
+	# persist-key remains functional through 2.6; 2.7 ignores it as redundant.
+	if [ -z "$VPN_OVPNVER" ] || ! Validate_Number "$VPN_OVPNVER" || [ "$VPN_OVPNVER" -lt 2007000 ]; then
+		VPN_CUSTOM_LEGACY_SHARED="$VPN_CUSTOM_LEGACY_SHARED
+persist-key"
+		VPN_CUSTOM_MODERN_SHARED="$VPN_CUSTOM_MODERN_SHARED
+persist-key"
 	fi
-
-	VPN_MUTE="$(grep "vpn${VPN_NO}_mute" "$SCRIPT_CONF" | cut -f2 -d"=")"
-	[ -z "$VPN_MUTE" ] && VPN_MUTE="20"
 	if Validate_Number "$VPN_MUTE" && [ "$VPN_MUTE" -gt 0 ]; then
-		vpncustomoptions="$vpncustomoptions
+		VPN_CUSTOM_LEGACY_SHARED="$VPN_CUSTOM_LEGACY_SHARED
+mute $VPN_MUTE"
+		VPN_CUSTOM_MODERN_SHARED="$VPN_CUSTOM_MODERN_SHARED
 mute $VPN_MUTE"
 	fi
-
-	VPN_DEBUGVERB="$(grep "vpn${VPN_NO}_debugverb" "$SCRIPT_CONF" | cut -f2 -d"=")"
 	if [ "$VPN_DEBUGVERB" = "true" ]; then
-		vpncustomoptions="$vpncustomoptions
+		VPN_CUSTOM_LEGACY_SHARED="$VPN_CUSTOM_LEGACY_SHARED
+verb 4"
+		VPN_CUSTOM_MODERN_SHARED="$VPN_CUSTOM_MODERN_SHARED
 verb 4"
 	fi
 
-	if [ "$VPN_PROT_SHORT" = "UDP" ]; then
-		vpncustomoptions="$vpncustomoptions
-explicit-exit-notify 3"
+	# Keep six family/protocol lists explicit even where entries are shared.
+	VPN_CUSTOM_LEGACY_UDP='explicit-exit-notify 3'
+	VPN_CUSTOM_LEGACY_TCP=""
+	VPN_CUSTOM_MODERN_UDP='explicit-exit-notify 3'
+	VPN_CUSTOM_MODERN_TCP=""
+	if [ "$VPN_PROVIDER_LC" = "nordvpn" ]; then
+		if [ "$VPN_CUSTOM_FAMILY" = "legacy" ]; then
+			VPN_CUSTOM_LEGACY_UDP="$(printf 'tun-mtu 1500\ntun-mtu-extra 32\n%s\nmssfix 1450' "$VPN_CUSTOM_LEGACY_UDP")"
+			VPN_CUSTOM_LEGACY_TCP="$(printf 'tun-mtu 1500\ntun-mtu-extra 32')"
+		fi
 	fi
-	
-	if [ "$VPN_PROVIDER" = "NordVPN" ]; then
-		vpncustomoptions="$vpncustomoptions
-tun-mtu 1500
-tun-mtu-extra 32
-mssfix 1450"
+	# fast-io is supported before 2.7 only for UDP/non-Windows clients, but
+	# effective shaper state is unavailable here; omit it rather than infer from
+	# profile text that shaping is disabled.
+	if [ "$VPN_CUSTOM_FAMILY" = "modern" ]; then
+		vpncustomoptions="$VPN_CUSTOM_MODERN_SHARED"
+		if [ "$VPN_PROT_SHORT" = "UDP" ]; then
+			[ -n "$VPN_CUSTOM_MODERN_UDP" ] && vpncustomoptions="$vpncustomoptions
+$VPN_CUSTOM_MODERN_UDP"
+		else
+			[ -n "$VPN_CUSTOM_MODERN_TCP" ] && vpncustomoptions="$vpncustomoptions
+$VPN_CUSTOM_MODERN_TCP"
+		fi
+	else
+		vpncustomoptions="$VPN_CUSTOM_LEGACY_SHARED"
+		if [ "$VPN_PROT_SHORT" = "UDP" ]; then
+			[ -n "$VPN_CUSTOM_LEGACY_UDP" ] && vpncustomoptions="$vpncustomoptions
+$VPN_CUSTOM_LEGACY_UDP"
+		else
+			[ -n "$VPN_CUSTOM_LEGACY_TCP" ] && vpncustomoptions="$vpncustomoptions
+$VPN_CUSTOM_LEGACY_TCP"
+		fi
 	fi
-	
 	Write_VPNCustomOptions "$VPN_NO" "$vpncustomoptions"
 }
 
@@ -2255,18 +2339,41 @@ Write_VPNCustomOptions(){
 		vpncustomoptionsbase64="$(echo "$2" | head -c -1 | openssl base64 -A)"
 		
 		if [ "$(/bin/uname -m)" = "aarch64" ]; then
-			nvram set vpn_client"$1"_cust2="$(echo "$vpncustomoptionsbase64" | cut -c0-255)"
-			nvram set vpn_client"$1"_cust21="$(echo "$vpncustomoptionsbase64" | cut -c256-510)"
-			nvram set vpn_client"$1"_cust22="$(echo "$vpncustomoptionsbase64" | cut -c511-765)"
+			nvram set vpn_client"$1"_cust2="$(echo "$vpncustomoptionsbase64" | cut -c0-255)" || return 1
+			nvram set vpn_client"$1"_cust21="$(echo "$vpncustomoptionsbase64" | cut -c256-510)" || return 1
+			nvram set vpn_client"$1"_cust22="$(echo "$vpncustomoptionsbase64" | cut -c511-765)" || return 1
 		elif [ "$(uname -o)" = "ASUSWRT-Merlin" ]; then
-			nvram set vpn_client"$1"_cust2="$vpncustomoptionsbase64"
+			nvram set vpn_client"$1"_cust2="$vpncustomoptionsbase64" || return 1
 		else
-			nvram set vpn_client"$1"_custom="$2"
+			nvram set vpn_client"$1"_custom="$2" || return 1
 		fi
-		nvram commit
+		nvram commit || return 1
 	else
-		printf "%s" "$2" > /jffs/openvpn/vpn_client"$1"_custom3
+		printf "%s" "$2" > /jffs/openvpn/vpn_client"$1"_custom3 || return 1
 	fi
+}
+
+# Toggle_VPN_Custom_Settings slot; enabling writes the preset before setting
+# the flag, while disabling preserves the existing options block.
+Toggle_VPN_Custom_Settings(){
+	_TVCS_SLOT="$1"
+	_TVCS_MANAGED="$(grep "^vpn${_TVCS_SLOT}_managed=" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	if [ "$_TVCS_MANAGED" != "true" ]; then
+		Print_Output false "VPN client $_TVCS_SLOT is not managed, cannot apply custom settings" "$ERR"
+		return 1
+	fi
+	_TVCS_STATE="$(grep "^vpn${_TVCS_SLOT}_customsettings=" "$SCRIPT_CONF" | cut -f2 -d"=")"
+	if [ "$_TVCS_STATE" = "true" ]; then
+		sed -i 's/^vpn'"$_TVCS_SLOT"'_customsettings=.*$/vpn'"$_TVCS_SLOT"'_customsettings=false/' "$SCRIPT_CONF" || return 1
+		Print_Output true "Custom settings disabled for VPN client $_TVCS_SLOT" "$PASS"
+		return 0
+	fi
+	if ! SetVPNCustomSettings "$_TVCS_SLOT"; then
+		Print_Output false "Could not write custom settings for VPN client $_TVCS_SLOT; custom settings remain disabled" "$ERR"
+		return 1
+	fi
+	sed -i 's/^vpn'"$_TVCS_SLOT"'_customsettings=.*$/vpn'"$_TVCS_SLOT"'_customsettings=true/' "$SCRIPT_CONF" || return 1
+	Print_Output true "Custom settings enabled for VPN client $_TVCS_SLOT" "$PASS"
 }
 
 # With custom settings off the user's block is kept, but an imported profile's
@@ -2440,19 +2547,35 @@ MainMenu(){
 			;;
 			7)
 				printf "\\n"
-				if SetVPNClient hide; then
-					if [ "$(grep "vpn${GLOBAL_VPN_NO}_managed" "$SCRIPT_CONF" | cut -f2 -d"=")" = "false" ]; then
-						Print_Output false "VPN client $GLOBAL_VPN_NO is not managed, cannot apply custom settings" "$ERR"
+				printf "Please enter VPN client number(s) (e.g. 3, 1-5, or 1,4,2 - 'e' to cancel):  "
+				_menu7_cancel="false"
+				while true; do
+					if ! read -r slot_choice; then
+						return 0
+					fi
+					if [ "$slot_choice" = "e" ] || [ "$slot_choice" = "E" ]; then
+						_menu7_cancel="true"
 						break
-					fi
-					if [ "$(grep "vpn${GLOBAL_VPN_NO}_customsettings" "$SCRIPT_CONF" | cut -f2 -d"=")" = "false" ]; then
-						sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_customsettings.*$/vpn'"$GLOBAL_VPN_NO"'_customsettings=true/' "$SCRIPT_CONF"
-						SetVPNCustomSettings "$GLOBAL_VPN_NO"
+					elif ParseSlotSelection "$slot_choice"; then
+						break
 					else
-						sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_customsettings.*$/vpn'"$GLOBAL_VPN_NO"'_customsettings=false/' "$SCRIPT_CONF"
+						printf "\\n\\e[31mPlease enter a valid slot number, range (1-5), or comma list${CLEARFORMAT}\\n"
+						printf "Please enter VPN client number(s) (e.g. 3, 1-5, or 1,4,2 - 'e' to cancel):  "
 					fi
+				done
+				if [ "$_menu7_cancel" = "false" ]; then
+					for _menu7_slot in $GLOBAL_VPN_SLOTS; do
+						GLOBAL_VPN_NO="$_menu7_slot"
+						if [ "$(grep "^vpn${GLOBAL_VPN_NO}_managed=" "$SCRIPT_CONF" | cut -f2 -d"=")" != "true" ]; then
+							Print_Output false "VPN client $GLOBAL_VPN_NO is not managed; skipping custom settings" "$WARN"
+							continue
+						fi
+						if ! Toggle_VPN_Custom_Settings "$GLOBAL_VPN_NO"; then
+							Print_Output false "VPN client $GLOBAL_VPN_NO custom-settings toggle failed" "$ERR"
+						fi
+					done
+					PressEnter
 				fi
-				PressEnter
 				break
 			;;
 			8)
@@ -2488,10 +2611,19 @@ MainMenu(){
 							;;
 						esac
 					done
-					sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_mute.*$/vpn'"$GLOBAL_VPN_NO"'_mute='"$mute_choice"'/' "$SCRIPT_CONF"
-					sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_debugverb.*$/vpn'"$GLOBAL_VPN_NO"'_debugverb='"$debugverb_choice"'/' "$SCRIPT_CONF"
+					sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_mute.*$/vpn'"$GLOBAL_VPN_NO"'_mute='"$mute_choice"'/' "$SCRIPT_CONF" || {
+						Print_Output false "Could not save logging settings for VPN client $GLOBAL_VPN_NO" "$ERR"
+						break
+					}
+					sed -i 's/^vpn'"$GLOBAL_VPN_NO"'_debugverb.*$/vpn'"$GLOBAL_VPN_NO"'_debugverb='"$debugverb_choice"'/' "$SCRIPT_CONF" || {
+						Print_Output false "Could not save logging settings for VPN client $GLOBAL_VPN_NO" "$ERR"
+						break
+					}
 					if [ "$(grep "vpn${GLOBAL_VPN_NO}_customsettings" "$SCRIPT_CONF" | cut -f2 -d"=")" = "true" ]; then
-						SetVPNCustomSettings "$GLOBAL_VPN_NO"
+						if ! SetVPNCustomSettings "$GLOBAL_VPN_NO"; then
+							Print_Output false "Could not write custom OpenVPN options for VPN client $GLOBAL_VPN_NO" "$ERR"
+							break
+						fi
 					fi
 					Print_Output true "Updated logging settings for VPN client $GLOBAL_VPN_NO" "$PASS"
 				fi

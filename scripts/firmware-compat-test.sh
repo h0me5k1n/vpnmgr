@@ -13,7 +13,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
 
 for fn in Firmware_Number_Check Firmware_Build_Before Validate_Number \
     getIP getPort getCipher getAuthDigest getClientCA getConnectState \
-    UpdateVPNConfig SetVPNCustomSettings Write_VPNCustomOptions Strip_Stale_X509Name; do
+    UpdateVPNConfig SetVPNCustomSettings Write_VPNCustomOptions Toggle_VPN_Custom_Settings Strip_Stale_X509Name; do
     sed -n "/^${fn}(){/,/^}/p" "$FW_TEST_SOURCE"
 done | sed -e 's@/jffs/openvpn/@"$_FW_TEST_DIR"/openvpn/@g' \
     -e 's@/bin/uname@uname@g' > "$_FW_TEST_DIR/functions.sh"
@@ -60,6 +60,7 @@ nvram() {
 Print_Output() { :; }
 Load_Provider() { [[ "$1" == nordvpn ]]; }
 OpenVPN_Version_Number() { printf '2007000\n'; }
+Detect_OpenVPN_Runtime() { OVPN_RUNTIME_VERSION=2.7.0; OVPN_RUNTIME_NUMBER=2007000; OVPN_RUNTIME_FAMILY=modern; OVPN_RUNTIME_STATUS=detected; }
 provider_nordvpn_get_server() { printf 'au1123.nordvpn.com\n'; }
 provider_nordvpn_get_ovpn() { [[ "${FW_TEST_DOWNLOAD_FAIL:-false}" == false ]] || return 1; printf '%s\n' "$FW_TEST_PROFILE"; }
 provider_nordvpn_get_short_name() { printf 'AU1123\n'; }
