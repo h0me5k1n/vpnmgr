@@ -161,7 +161,7 @@ if RestartVPNClient 1; then fail 'restart start failure masked'; fi
 SERVICE_FAIL=none
 RestartVPNClient 1 || fail 'restart success'
 # Exercise real update return paths with a minimal provider and no waits/network.
-for fn in Default_VPN_Data_Ciphers UpdateVPNConfig; do
+for fn in Default_VPN_Data_Ciphers Normalize_OVPN_Profile UpdateVPNConfig; do
 	sed -n "/^${fn}(){/,/^}/p" "$ROOT/vpnmgr.sh"
 done > "$TEST_DIR/update"
 (

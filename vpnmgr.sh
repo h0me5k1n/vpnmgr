@@ -32,7 +32,11 @@
 readonly SCRIPT_NAME="vpnmgr"
 readonly SCRIPT_VERSION="v3.4.1"
 SCRIPT_BRANCH="main"
-SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$SCRIPT_BRANCH"
+SCRIPT_REPOSITORY="h0me5k1n/vpnmgr"
+SCRIPT_BRANCH_OVERRIDE=""
+SCRIPT_REPO="https://raw.githubusercontent.com/$SCRIPT_REPOSITORY/$SCRIPT_BRANCH"
+SCRIPT_REVISION=""
+SCRIPT_UPDATE_READY="false"
 readonly SCRIPT_DIR="/jffs/addons/$SCRIPT_NAME.d"
 readonly SCRIPT_CONF="$SCRIPT_DIR/config"
 readonly OVPN_ARCHIVE_DIR="$SCRIPT_DIR/ovpn"
@@ -42,6 +46,9 @@ readonly SCRIPT_WEB_DIR="$SCRIPT_WEBPAGE_DIR/$SCRIPT_NAME"
 readonly SCRIPT_WWW_DIR="$SCRIPT_DIR/www"
 readonly SCRIPT_FILES_VERSION="$SCRIPT_DIR/.files_version"
 readonly SCRIPT_SOURCE_FILE="$SCRIPT_DIR/.install_source"
+readonly SCRIPT_SOURCE_REVISION_FILE="$SCRIPT_DIR/.install_revision"
+readonly SCRIPT_FILES_SOURCE="$SCRIPT_DIR/.files_source"
+readonly SCRIPT_TEST_PROVIDER_FILE="$SCRIPT_DIR/.test_providers"
 SCRIPT_SOURCE=""
 [ -z "$(nvram get odmpid)" ] && ROUTER_MODEL=$(nvram get productid) || ROUTER_MODEL=$(nvram get odmpid)
 GLOBAL_VPN_NO=""
@@ -240,21 +247,111 @@ Set_Version_Custom_Settings(){
 # file in the install comes from that one commit even if the branch moves
 # meanwhile, and sets SCRIPT_SOURCE to "<branch>@<short commit>".
 Pin_Script_Repo(){
-	_psr_sha="$(/usr/sbin/curl -fsL --retry 3 -H 'Accept: application/vnd.github.sha' \
-		"https://api.github.com/repos/h0me5k1n/$SCRIPT_NAME/commits/$1")"
-	if printf '%s' "$_psr_sha" | grep -Eq '^[0-9a-f]{40}$'; then
-		SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$_psr_sha"
-		SCRIPT_SOURCE="$1@$(printf '%s' "$_psr_sha" | cut -c1-7)"
+	_psr_branch="${SCRIPT_BRANCH_OVERRIDE:-$1}"
+	_psr_ok=false
+	if [ "$#" -ge 2 ]; then
+		_psr_sha="$2"; _psr_ok=true
+	elif _psr_sha="$(/usr/sbin/curl -fsL --retry 3 -H 'Accept: application/vnd.github.sha' \
+		"https://api.github.com/repos/$SCRIPT_REPOSITORY/commits/$_psr_branch")"; then
+		_psr_ok=true
+	fi
+	if [ "$_psr_ok" = true ] && printf '%s' "$_psr_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+		SCRIPT_BRANCH="$_psr_branch"
+		SCRIPT_REVISION="$_psr_sha"
+		SCRIPT_REPO="https://raw.githubusercontent.com/$SCRIPT_REPOSITORY/$SCRIPT_REVISION"
+		SCRIPT_SOURCE="$SCRIPT_BRANCH@$(printf '%s' "$SCRIPT_REVISION" | cut -c1-7)"
 	else
-		Print_Output true "Could not look up the latest $1 commit - installing from the branch instead" "$WARN"
-		SCRIPT_REPO="https://raw.githubusercontent.com/h0me5k1n/$SCRIPT_NAME/$1"
-		SCRIPT_SOURCE="$1@unknown"
+		if [ -n "$SCRIPT_BRANCH_OVERRIDE" ] || [ "$#" -ge 2 ]; then
+			Print_Output true "Cannot resolve an exact $SCRIPT_REPOSITORY/$_psr_branch revision; stopping before downloads" "$ERR"
+			return 1
+		fi
+		Print_Output true "Could not look up the latest $_psr_branch commit - installing from the branch instead" "$WARN"
+		SCRIPT_BRANCH="$_psr_branch"; SCRIPT_REVISION=""
+		SCRIPT_REPO="https://raw.githubusercontent.com/$SCRIPT_REPOSITORY/$SCRIPT_BRANCH"
+		SCRIPT_SOURCE="$SCRIPT_BRANCH@unknown"
+	fi
+	SCRIPT_UPDATE_READY=true
+}
+
+Ensure_Update_Source(){
+	[ "$SCRIPT_UPDATE_READY" = true ] || Pin_Script_Repo "${SCRIPT_BRANCH_OVERRIDE:-main}"
+}
+
+Script_Source_Identity(){
+	printf '%s|%s|%s' "$SCRIPT_REPOSITORY" "$SCRIPT_BRANCH" "$SCRIPT_REVISION"
+}
+
+Load_Installed_Source(){
+	if [ -n "${VPNMGR_INSTALL_SHA:-}" ]; then
+		Pin_Script_Repo "${VPNMGR_INSTALL_BRANCH:-$SCRIPT_BRANCH}" "$VPNMGR_INSTALL_SHA" || return 1
+	else
+		[ -f "$SCRIPT_SOURCE_REVISION_FILE" ] || return 1
+		IFS='|' read -r _lis_repo _lis_branch _lis_sha < "$SCRIPT_SOURCE_REVISION_FILE" || return 1
+		[ "$_lis_repo" = "$SCRIPT_REPOSITORY" ] && [ -n "$_lis_branch" ] || return 1
+		Pin_Script_Repo "$_lis_branch" "$_lis_sha" || return 1
+	fi
+	# Installed provenance repairs this build; a later update chooses a new tip.
+	SCRIPT_UPDATE_READY=false
+}
+
+Resolve_Installed_Source(){
+	if Load_Installed_Source; then return 0; fi
+	# A test bootstrap must provide its already-resolved SHA, never resolve again.
+	[ -z "$SCRIPT_BRANCH_OVERRIDE" ] || {
+		Print_Output true "Missing exact test-build revision; install using VPNMGR_INSTALL_SHA" "$ERR"
+		return 1
+	}
+	# Older updaters did not record a full revision. Only adopt a candidate when
+	# its script bytes match the script already running, before repairing assets.
+	Pin_Script_Repo "$SCRIPT_BRANCH" || return 1
+	SCRIPT_UPDATE_READY=false
+	[ -n "$SCRIPT_REVISION" ] || return 1
+	_ris_file="$(mktemp /tmp/vpnmgr-source.XXXXXX)" || return 1
+	if ! Download_File "$SCRIPT_REPO/$SCRIPT_NAME.sh" "$_ris_file" || ! cmp -s "$_ris_file" "/jffs/scripts/$SCRIPT_NAME"; then
+		rm -f "$_ris_file"
+		Print_Output true "Installed script revision is unverified; use forceupdate for a coherent refresh" "$WARN"
+		return 1
+	fi
+	rm -f "$_ris_file"
+	Record_Install_Source || return 1
+	SCRIPT_UPDATE_READY=false
+}
+
+Configure_Test_Providers(){
+	[ "${VPNMGR_TEST_PROVIDERS+x}" = x ] || return 0
+	case "$VPNMGR_TEST_PROVIDERS" in
+		nordvpn) printf '%s\n' nordvpn > "$SCRIPT_TEST_PROVIDER_FILE" ;;
+		'') rm -f "$SCRIPT_TEST_PROVIDER_FILE" ;;
+		*) Print_Output true "Unsupported test-provider selection" "$ERR"; return 1 ;;
+	esac
+}
+
+Provider_WebUI_Enabled(){
+	[ "$2" != ACTIVE ] || return 0
+	[ "$1" = nordvpn ] || return 1
+	case "$2" in UNTESTED|API_TESTED) grep -qx nordvpn "$SCRIPT_TEST_PROVIDER_FILE" 2>/dev/null ;; *) return 1 ;; esac
+}
+
+Select_Install_Source(){
+	if [ -n "${VPNMGR_INSTALL_SHA:-}" ]; then
+		Pin_Script_Repo "${VPNMGR_INSTALL_BRANCH:-$SCRIPT_BRANCH}" "$VPNMGR_INSTALL_SHA"
+	elif [ -n "$SCRIPT_BRANCH_OVERRIDE" ]; then
+		Print_Output true "The test installer must receive its bootstrap's VPNMGR_INSTALL_SHA" "$ERR"
+		return 1
+	else
+		Pin_Script_Repo "$SCRIPT_BRANCH"
 	fi
 }
 
 # Records where the script just installed came from, for the CLI header and
 # WebUI. Installs from main show only the version, so the record is removed.
 Record_Install_Source(){
+	if [ -n "$SCRIPT_SOURCE" ] && [ -n "$SCRIPT_REVISION" ]; then
+		Script_Source_Identity > "$SCRIPT_SOURCE_REVISION_FILE" || return 1
+		printf '\n' >> "$SCRIPT_SOURCE_REVISION_FILE" || return 1
+	else
+		rm -f "$SCRIPT_SOURCE_REVISION_FILE" || return 1
+	fi
 	if [ -n "$SCRIPT_SOURCE" ] && [ "${SCRIPT_SOURCE%%@*}" != "main" ]; then
 		printf '%s\n' "$SCRIPT_SOURCE" > "$SCRIPT_SOURCE_FILE"
 		Set_Version_Custom_Settings source "$SCRIPT_SOURCE"
@@ -265,18 +362,22 @@ Record_Install_Source(){
 }
 
 Update_Check(){
+	Ensure_Update_Source || return 1
 	echo 'var updatestatus = "InProgress";' > "$SCRIPT_WEB_DIR/detect_update.js"
 	doupdate="false"
 	localver=$(grep "SCRIPT_VERSION=" "/jffs/scripts/$SCRIPT_NAME" | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')
-	/usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" | grep -qF "h0me5k1n" || { Print_Output true "404 error detected - stopping update" "$ERR"; return 1; }
-	serverver=$(/usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" | grep "SCRIPT_VERSION=" | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')
+	_uc_file="$(mktemp "$SCRIPT_DIR/.update-check.XXXXXX")" || return 1
+	if ! Download_File "$SCRIPT_REPO/$SCRIPT_NAME.sh" "$_uc_file" || ! grep -qF h0me5k1n "$_uc_file"; then
+		rm -f "$_uc_file"; Print_Output true "Cannot retrieve a valid update script" "$ERR"; return 1
+	fi
+	serverver="$(grep 'SCRIPT_VERSION=' "$_uc_file" | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')" || { rm -f "$_uc_file"; return 1; }
 	if [ "$localver" != "$serverver" ]; then
 		doupdate="version"
 		Set_Version_Custom_Settings server "$serverver"
 		echo 'var updatestatus = "'"$serverver"'";'  > "$SCRIPT_WEB_DIR/detect_update.js"
 	else
 		localmd5="$(md5sum "/jffs/scripts/$SCRIPT_NAME" | awk '{print $1}')"
-		remotemd5="$(curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" | md5sum | awk '{print $1}')"
+		remotemd5="$(md5sum "$_uc_file" | awk '{print $1}')"
 		if [ "$localmd5" != "$remotemd5" ]; then
 			doupdate="md5"
 			Set_Version_Custom_Settings server "$serverver-hotfix"
@@ -286,12 +387,17 @@ Update_Check(){
 	if [ "$doupdate" = "false" ]; then
 		echo 'var updatestatus = "None";'  > "$SCRIPT_WEB_DIR/detect_update.js"
 	fi
+	rm -f "$_uc_file"
 	echo "$doupdate,$localver,$serverver"
 }
 
 Update_Version(){
+	# Select outside Update_Check's command substitution and retain one candidate
+	# for every script/provider/asset request made by this operation.
+	Pin_Script_Repo "${3:-${SCRIPT_BRANCH_OVERRIDE:-main}}" || return 1
+	Configure_Test_Providers || return 1
 	if [ -z "$1" ]; then
-		updatecheckresult="$(Update_Check)"
+		updatecheckresult="$(Update_Check)" || return 1
 		isupdate="$(echo "$updatecheckresult" | cut -f1 -d',')"
 		localver="$(echo "$updatecheckresult" | cut -f2 -d',')"
 		serverver="$(echo "$updatecheckresult" | cut -f3 -d',')"
@@ -307,20 +413,20 @@ Update_Version(){
 			read -r confirm
 			case "$confirm" in
 				y|Y)
-					Update_File web-assets
-					Update_File vpnmgr_www.asp
-					Update_Addon_Files "$serverver"
+					Update_Addon_Files "$serverver" || return 1
 					printf "\\n"
 					if /usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" -o "/jffs/scripts/$SCRIPT_NAME"; then
 						Print_Output true "$SCRIPT_NAME successfully updated"
-						Record_Install_Source
+						Record_Install_Source || return 1
+					else
+						return 1
 					fi
 					chmod 0755 "/jffs/scripts/$SCRIPT_NAME"
 					Set_Version_Custom_Settings local "$serverver"
 					Set_Version_Custom_Settings server "$serverver"
 					Clear_Lock
 					PressEnter
-					exec "$0"
+					VPNMGR_INSTALL_SHA="$SCRIPT_REVISION" VPNMGR_INSTALL_BRANCH="$SCRIPT_BRANCH" exec "$0"
 					exit 0
 				;;
 				*)
@@ -337,14 +443,15 @@ Update_Version(){
 	fi
 	
 	if [ "$1" = "force" ]; then
-		serverver=$(/usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" | grep "SCRIPT_VERSION=" | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')
+		_uv_script="$(/usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh")" || return 1
+		serverver="$(printf '%s\n' "$_uv_script" | grep 'SCRIPT_VERSION=' | grep -m1 -oE 'v[0-9]{1,2}([.][0-9]{1,2})([.][0-9]{1,2})')" || return 1
 		Print_Output true "Downloading latest version ($serverver) of $SCRIPT_NAME" "$PASS"
-		Update_File web-assets
-		Update_File vpnmgr_www.asp
-		Update_Addon_Files "$serverver"
+		Update_Addon_Files "$serverver" || return 1
 		if /usr/sbin/curl -fsL --retry 3 "$SCRIPT_REPO/$SCRIPT_NAME.sh" -o "/jffs/scripts/$SCRIPT_NAME"; then
 			Print_Output true "$SCRIPT_NAME successfully updated"
-			Record_Install_Source
+			Record_Install_Source || return 1
+		else
+			return 1
 		fi
 		chmod 0755 "/jffs/scripts/$SCRIPT_NAME"
 		Set_Version_Custom_Settings local "$serverver"
@@ -352,9 +459,9 @@ Update_Version(){
 		Clear_Lock
 		if [ -z "$2" ]; then
 			PressEnter
-			exec "$0"
+			VPNMGR_INSTALL_SHA="$SCRIPT_REVISION" VPNMGR_INSTALL_BRANCH="$SCRIPT_BRANCH" exec "$0"
 		elif [ "$2" = "unattended" ]; then
-			exec "$0" postupdate
+			VPNMGR_INSTALL_SHA="$SCRIPT_REVISION" VPNMGR_INSTALL_BRANCH="$SCRIPT_BRANCH" exec "$0" postupdate
 		fi
 		exit 0
 	fi
@@ -362,31 +469,31 @@ Update_Version(){
 
 Update_File(){
 	if [ "$1" = "web-assets" ]; then
-		Download_File "$SCRIPT_REPO/www/jquery.js" "$SCRIPT_WWW_DIR/jquery.js"
-		Download_File "$SCRIPT_REPO/www/detect.js" "$SCRIPT_WWW_DIR/detect.js"
+		Download_Asset "$SCRIPT_REPO/www/jquery.js" "$SCRIPT_WWW_DIR/jquery.js" || return 1
+		Download_Asset "$SCRIPT_REPO/www/detect.js" "$SCRIPT_WWW_DIR/detect.js" || return 1
 		Print_Output true "Web assets updated" "$PASS"
 	elif [ "$1" = "vpnmgr_www.asp" ]; then
-		tmpfile="/tmp/$1"
-		Download_File "$SCRIPT_REPO/$1" "$tmpfile"
+		tmpfile="$(mktemp "$SCRIPT_DIR/.$1.XXXXXX")" || return 1
+		Download_File "$SCRIPT_REPO/$1" "$tmpfile" || { rm -f "$tmpfile"; return 1; }
 		if ! diff -q "$tmpfile" "$SCRIPT_DIR/$1" >/dev/null 2>&1; then
 			if [ -f "$SCRIPT_DIR/$1" ]; then
 				Get_WebUI_Page "$SCRIPT_DIR/$1"
 				sed -i "\\~$MyPage~d" /tmp/menuTree.js
 				rm -f "$SCRIPT_WEBPAGE_DIR/$MyPage" 2>/dev/null
 			fi
-			Download_File "$SCRIPT_REPO/$1" "$SCRIPT_DIR/$1"
+			cp -f "$tmpfile" "$SCRIPT_DIR/$1" || { rm -f "$tmpfile"; return 1; }
 			Print_Output true "New version of $1 downloaded" "$PASS"
-			Mount_WebUI
+			Mount_WebUI || { rm -f "$tmpfile"; return 1; }
 		fi
 		rm -f "$tmpfile"
 	elif [ "$1" = "vpnmgr_www.js" ]; then
-		tmpfile="/tmp/$1"
+		tmpfile="$(mktemp "$SCRIPT_DIR/.$1.XXXXXX")" || return 1
 		Download_File "$SCRIPT_REPO/$1" "$tmpfile" || { rm -f "$tmpfile"; return 1; }
 		if ! diff -q "$tmpfile" "$SCRIPT_DIR/$1" >/dev/null 2>&1; then
-			Download_File "$SCRIPT_REPO/$1" "$SCRIPT_DIR/$1"
-			cp -f "$SCRIPT_DIR/$1" "$SCRIPT_WEB_DIR/$1"
+			cp -f "$tmpfile" "$SCRIPT_DIR/$1" || { rm -f "$tmpfile"; return 1; }
 			Print_Output true "New version of $1 downloaded" "$PASS"
 		fi
+		cp -f "$SCRIPT_DIR/$1" "$SCRIPT_WEB_DIR/$1" || { rm -f "$tmpfile"; return 1; }
 		rm -f "$tmpfile"
 	else
 		return 1
@@ -397,8 +504,9 @@ Update_File(){
 # script itself. $1 is the version they were fetched for, recorded so that
 # Sync_Addon_Files can tell when they are out of step with the script.
 Update_Addon_Files(){
-	if Update_File vpnmgr_www.js && Install_Providers; then
-		printf '%s\n' "$1" > "$SCRIPT_FILES_VERSION"
+	if Update_File web-assets && Update_File vpnmgr_www.asp && Update_File vpnmgr_www.js && Install_Providers; then
+		printf '%s\n' "$1" > "$SCRIPT_FILES_VERSION" || return 1
+		Script_Source_Identity > "$SCRIPT_FILES_SOURCE" || return 1
 	else
 		Print_Output true "Failed to refresh WebUI and provider files - will retry when $SCRIPT_NAME is next opened" "$WARN"
 		return 1
@@ -408,7 +516,9 @@ Update_Addon_Files(){
 # Versions up to v3.3.0 did not refresh these files on update, and the updater
 # that runs is always the outgoing version's, so catch up here on first run.
 Sync_Addon_Files(){
-	if [ "$(cat "$SCRIPT_FILES_VERSION" 2>/dev/null)" != "$SCRIPT_VERSION" ]; then
+	Resolve_Installed_Source || return 1
+	if [ "$(cat "$SCRIPT_FILES_VERSION" 2>/dev/null)" != "$SCRIPT_VERSION" ] ||
+		[ "$(cat "$SCRIPT_FILES_SOURCE" 2>/dev/null)" != "$(Script_Source_Identity)" ]; then
 		Print_Output true "Refreshing WebUI and provider files for $SCRIPT_VERSION"
 		Update_Addon_Files "$SCRIPT_VERSION"
 	fi
@@ -518,6 +628,15 @@ Auto_Cron(){
 
 Download_File(){
 	/usr/sbin/curl -fsL --retry 3 "$1" -o "$2"
+}
+
+Download_Asset(){
+	_da_file="$(mktemp "$2.XXXXXX")" || return 1
+	if Download_File "$1" "$_da_file" && chmod 0644 "$_da_file" && mv -f "$_da_file" "$2"; then
+		return 0
+	fi
+	rm -f "$_da_file"
+	return 1
 }
 
 Get_WebUI_Page(){
@@ -1231,7 +1350,7 @@ Create_Symlinks(){
 		_pid="${_pbase#provider_}"; _pid="${_pid%.sh}"
 		_pname="$(grep "^# Display:" "$_pfile" | sed 's/^# Display: //')"
 		_pstatus="$(grep "^# Status:" "$_pfile" | awk '{print $3}')"
-		if [ "$_pstatus" = "ACTIVE" ]; then
+		if Provider_WebUI_Enabled "$_pid" "$_pstatus"; then
 			printf '%s|%s\n' "$_pid" "$_pname" >> "$SCRIPT_DIR/providers_list"
 			ln -s "$SCRIPT_DIR/${_pid}_countrydata" "$SCRIPT_WEB_DIR/${_pid}_countrydata.htm" 2>/dev/null
 		fi
@@ -1240,7 +1359,7 @@ Create_Symlinks(){
 
 	cp -f "$SCRIPT_DIR/vpnmgr_www.js" "$SCRIPT_WEB_DIR/vpnmgr_www.js" 2>/dev/null
 
-	Runtime_Init && ln -s "$VPNMGR_RUNTIME_DIR" "$SCRIPT_WEB_DIR/runtime" 2>/dev/null
+	Runtime_Init && ln -s "$VPNMGR_RUNTIME_DIR" "$SCRIPT_WEB_DIR/runtime" 2>/dev/null || return 1
 
 	ln -s /tmp/detect_vpnmgr.js "$SCRIPT_WEB_DIR/detect_vpnmgr.js" 2>/dev/null
 	ln -s /tmp/vpnmgrserverloads "$SCRIPT_WEB_DIR/vpnmgrserverloads.js" 2>/dev/null
@@ -1255,10 +1374,14 @@ Install_Providers(){
 	_ip_rc=0
 	# shellcheck disable=SC2043
 	for provider in nordvpn; do
-		/usr/sbin/curl -fsL --retry 3 \
-			"$SCRIPT_REPO/providers/provider_${provider}.sh" \
-			-o "$PROVIDERS_DIR/provider_${provider}.sh" || _ip_rc=1
-		chmod 0755 "$PROVIDERS_DIR/provider_${provider}.sh"
+		_ip_file="$(mktemp "$PROVIDERS_DIR/.provider_${provider}.XXXXXX")" || return 1
+		if Download_File "$SCRIPT_REPO/providers/provider_${provider}.sh" "$_ip_file" &&
+			chmod 0755 "$_ip_file" && mv -f "$_ip_file" "$PROVIDERS_DIR/provider_${provider}.sh"; then
+			:
+		else
+			rm -f "$_ip_file"
+			_ip_rc=1
+		fi
 	done
 	return "$_ip_rc"
 }
@@ -3082,21 +3205,22 @@ Menu_Install(){
 	
 	Create_Dirs
 	Conf_Exists
-	Create_Symlinks
+	Configure_Test_Providers || return 1
 	Auto_Cron create 2>/dev/null
 	Auto_Startup create 2>/dev/null
 	Auto_ServiceEvent create 2>/dev/null
 	
-	Update_File vpnmgr_www.asp
-	Update_File web-assets
-	Update_Addon_Files "$SCRIPT_VERSION"
+	Update_Addon_Files "$SCRIPT_VERSION" || return 1
+	Record_Install_Source || return 1
 	Refresh_Provider_Cache
+	Create_Symlinks || return 1
 
 	Set_Version_Custom_Settings local "$SCRIPT_VERSION"
 	Set_Version_Custom_Settings server "$SCRIPT_VERSION"
 	Shortcut_Script create
 	Clear_Lock
 
+	SCRIPT_UPDATE_READY=false
 	ScriptHeader
 	MainMenu
 }
@@ -3287,9 +3411,10 @@ fi
 
 case "$1" in
 	install)
+		Select_Install_Source || exit 1
 		Check_Lock
 		Menu_Install
-		exit 0
+		exit $?
 	;;
 	updatevpn)
 		NTP_Ready
@@ -3364,13 +3489,14 @@ case "$1" in
 	;;
 	update)
 		Update_Version
-		exit 0
+		exit $?
 	;;
 	forceupdate)
 		Update_Version force
-		exit 0
+		exit $?
 	;;
 	setversion)
+		Resolve_Installed_Source || exit 1
 		Set_Version_Custom_Settings local "$SCRIPT_VERSION"
 		Set_Version_Custom_Settings server "$SCRIPT_VERSION"
 		if [ ! -f /opt/bin/7za ]; then
@@ -3383,12 +3509,13 @@ case "$1" in
 		Auto_Startup create 2>/dev/null
 		Auto_ServiceEvent create 2>/dev/null
 		Shortcut_Script create
-		Install_Providers
+		Sync_Addon_Files || exit 1
 		Refresh_Provider_Cache
 		Create_Symlinks
 		exit 0
 	;;
 	postupdate)
+		Resolve_Installed_Source || exit 1
 		if [ ! -f /opt/bin/7za ]; then
 			opkg update
 			opkg install p7zip
@@ -3399,7 +3526,7 @@ case "$1" in
 		Auto_Startup create 2>/dev/null
 		Auto_ServiceEvent create 2>/dev/null
 		Shortcut_Script create
-		Install_Providers
+		Sync_Addon_Files || exit 1
 		Refresh_Provider_Cache
 		Create_Symlinks
 		exit 0
@@ -3416,15 +3543,13 @@ case "$1" in
 	;;
 	develop)
 		SCRIPT_BRANCH="develop"
-		Pin_Script_Repo "$SCRIPT_BRANCH"
-		Update_Version force
-		exit 0
+		Update_Version force "" "$SCRIPT_BRANCH"
+		exit $?
 	;;
 	stable)
 		SCRIPT_BRANCH="main"
-		Pin_Script_Repo "$SCRIPT_BRANCH"
-		Update_Version force
-		exit 0
+		Update_Version force "" "$SCRIPT_BRANCH"
+		exit $?
 	;;
 	uninstall)
 		Menu_Uninstall
