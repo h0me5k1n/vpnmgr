@@ -5,12 +5,41 @@ var fs = require('fs');
 var vm = require('vm');
 
 var jqueryState = {ajax:null,text:{},shown:{},properties:{}};
+var consoleSnapshots = [];
+var loadingState = {showArguments:[],hideCalls:0,visible:false};
+var domNodes = {};
+function fakeNode(tagName,id){
+	var node = {tagName:String(tagName || 'div').toUpperCase(),id:id || '',style:{},children:[],parentNode:null,textContent:'',appendChild:function(child){
+		if(child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
+		this.children.push(child); child.parentNode = this; return child;
+	},removeChild:function(child){
+		var index = this.children.indexOf(child); if(index != -1) this.children.splice(index,1); child.parentNode = null; return child;
+	}};
+	if(node.id) domNodes[node.id] = node;
+	if(node.tagName == 'TABLE') node.insertRow = function(){
+		var row = fakeNode('tr'); row.insertCell = function(){ return this.appendChild(fakeNode('td')); };
+		this.appendChild(row); return row;
+	};
+	return node;
+}
+var htmlNode = fakeNode('html','html');
+var bodyNode = fakeNode('body','body');
+var recoveryHome = fakeNode('div','vpnmgr_recovery_placeholder');
+var recoveryControls = fakeNode('div','vpnmgr_recovery_controls'); recoveryHome.appendChild(recoveryControls);
+var recoveryNotice = fakeNode('span','vpnmgr_recovery_notice'); recoveryControls.appendChild(recoveryNotice);
+var continueButton = fakeNode('button','btnContinueApply'); recoveryControls.appendChild(continueButton);
+var reloadButton = fakeNode('button','btnReloadSettings'); recoveryControls.appendChild(reloadButton);
+var loadingTable = fakeNode('table','loadingBlock');
+var proceedingMain = fakeNode('span','proceeding_main_txt');
+var proceedingDetail = fakeNode('span','proceeding_txt');
+var loadingMask = fakeNode('div','Loading');
+bodyNode.appendChild(recoveryHome);
 function jQueryStub(selector){
 	return {
 		prop:function(name,value){ jqueryState.properties[String(selector)+':'+name] = value; return this; },
-		text:function(value){ jqueryState.text[String(selector)] = value; return this; },
-		hide:function(){ jqueryState.shown[String(selector)] = false; return this; },
-		show:function(){ jqueryState.shown[String(selector)] = true; return this; },
+		text:function(value){ jqueryState.text[String(selector)] = value; var node = domNodes[String(selector).replace(/^#/,'')]; if(node) node.textContent = value; return this; },
+		hide:function(){ jqueryState.shown[String(selector)] = false; var node = domNodes[String(selector).replace(/^#/,'')]; if(node) node.style.display = 'none'; return this; },
+		show:function(){ jqueryState.shown[String(selector)] = true; var node = domNodes[String(selector).replace(/^#/,'')]; if(node) node.style.display = ''; return this; },
 		serializeArray:function(){
 			if(selector === context.document.formScriptActions) return context.document.formScriptActions.fields || [];
 			return [];
@@ -33,12 +62,15 @@ jQueryStub.each = function(items,callback){
 var formElements = [];
 var context = {
 	jQuery:jQueryStub,
-	document:{form:{elements:formElements},formScriptActions:{elements:[],fields:[{name:'productid',value:'router'},{name:'action_script',value:''}]},createElement:function(){return {};},getElementById:function(){return {style:{}};},getElementsByTagName:function(){return []; }},
-	window:{location:{pathname:'/vpnmgr.asp'}},
-	location:{reload:function(){}},
+	document:{form:{elements:formElements},formScriptActions:{elements:[],fields:[{name:'productid',value:'router'},{name:'action_script',value:''}]},documentElement:htmlNode,body:bodyNode,createElement:function(tag){return fakeNode(tag);},getElementById:function(id){return domNodes[id] || null;},getElementsByTagName:function(){return []; }},
+	window:{location:{pathname:'/vpnmgr.asp'},pageXOffset:17,pageYOffset:29,scrollTo:function(x,y){context.lastScroll=[x,y];}},
+	location:{reload:function(){context.reloadCount=(context.reloadCount || 0)+1;}},
 	setTimeout:function(callback){ context.queuedTimer = callback; return 1; },
 	clearTimeout:function(){},
 	alert:function(message){ context.lastAlert = message; },
+	console:{log:function(prefix,snapshot){consoleSnapshots.push(JSON.parse(snapshot));},error:function(prefix,snapshot){consoleSnapshots.push(JSON.parse(snapshot));}},
+	showLoading:function(){loadingState.showArguments.push(arguments.length);loadingState.visible=true;loadingMask.style.display='block';loadingMask.style.visibility='visible';htmlNode.style.overflow='hidden';proceedingMain.textContent='Please wait,';},
+	hideLoading:function(){loadingState.hideCalls++;loadingState.visible=false;loadingMask.style.display='none';loadingMask.style.visibility='hidden';htmlNode.style.overflow='';},
 	show_menu:function(){},
 	showhide:function(){},
 	custom_settings:{vpnmgr_version_local:'test-version',vpnmgr_version_server:'test-server',unrelated_setting:'keep-me'},
@@ -244,7 +276,7 @@ function testStatusCorrelationAndLateCompletion(){
 	};
 	context.PollApplyStatus(pending);
 	assert.strictEqual(context.vpnmgr_pendingApply,pending,'stale status must not complete another request');
-	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('stale') != -1);
+	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('stale') != -1);
 
 	var malformed = applyResponse(pending.requestId,'done',true);
 	malformed.clients.pop();
@@ -252,6 +284,12 @@ function testStatusCorrelationAndLateCompletion(){
 	var incompleteDone = applyResponse(pending.requestId,'done',true);
 	incompleteDone.clients[0].status = 'pending';
 	assert.strictEqual(context.ApplyResponseValid(incompleteDone),false);
+	var coerciveSlot = applyResponse(pending.requestId,'running',true);
+	coerciveSlot.clients[0].slot = {toString:null,valueOf:null};
+	assert.strictEqual(context.ApplyResponseValid(coerciveSlot),false,'slot values are exact numeric enums and are never coerced');
+	var nonArrayClients = applyResponse(pending.requestId,'running',true);
+	nonArrayClients.clients = {0:nonArrayClients.clients[0],1:nonArrayClients.clients[1],2:nonArrayClients.clients[2],3:nonArrayClients.clients[3],4:nonArrayClients.clients[4],length:5};
+	assert.strictEqual(context.ApplyResponseValid(nonArrayClients),false,'client collection must be an array');
 
 	context.vpnmgr_pendingApply = pending;
 	pending.polling = true;
@@ -278,7 +316,7 @@ function testStatusCorrelationAndLateCompletion(){
 	context.ContinueApplyChecking();
 	assert.strictEqual(context.vpnmgr_pendingApply,null,'late completion should finish the original request');
 	assert.strictEqual(calls.filter(function(call){return call.url == '/start_apply.htm' && call.data.filter(function(field){return field.name == 'action_script';})[0].value.indexOf('start_vpnmgrapply_') == 0;}).length,0);
-	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('Settings saved') != -1);
+	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('Settings saved') != -1);
 }
 
 function testPrepareGateAndNoncePost(){
@@ -371,7 +409,7 @@ function testRecoveryAfterLostSettingsPost(){
 	context.PostPreparedApply(pending);
 	assert.strictEqual(applyPosts,1,'the lost settings POST is attempted once');
 	assert.strictEqual(statusReads,1,'the ready reservation is recognized after POST loss');
-	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('submission is unconfirmed') != -1,'ready state explains uncertainty without a malformed-response message');
+	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('remains reserved') != -1,'ready state explains uncertainty without a malformed-response message');
 	pending.startedAt = 0;
 	context.PollApplyStatus(pending);
 	assert.strictEqual(pending.timedOut,true);
@@ -383,7 +421,7 @@ function testRecoveryAfterLostSettingsPost(){
 	assert.strictEqual(frozenPassword.disabled,false,'original form state is restored');
 	assert.strictEqual(frozenPassword.value,'keep-this-value','recovery never repopulates old values');
 	assert.strictEqual(applyPosts,1,'recovery never resubmits the settings payload');
-	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('expired') != -1);
+	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('expired') != -1);
 }
 
 function testRecoveryLossAndLateApplyAreUncertainSafe(){
@@ -462,8 +500,8 @@ function testPartialApplyResult(){
 	var data = applyResponse(pending.requestId,'done',true,['applied','failed','unmanaged','applied','applied']);
 	data.clients[1].connection = 'failed';
 	context.FinishApplyResult(pending,data);
-	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('VPN Client 2') != -1);
-	assert.strictEqual(jqueryState.shown['#btnReloadSettings'],true,'reload remains a user action');
+	assert.ok(context.lastAlert.indexOf('VPN Client 2') != -1);
+	assert.strictEqual(loadingState.visible,false,'terminal failure hides the apply overlay');
 }
 
 function testVerifiedStoppedConnectionStatus(){
@@ -472,9 +510,7 @@ function testVerifiedStoppedConnectionStatus(){
 	var data = applyResponse(pending.requestId,'done',true);
 	data.clients[0].connection = 'verified_stopped';
 	assert.strictEqual(context.ApplyResponseValid(data),true);
-	context.RenderApplyStatus(data);
-	assert.ok(jqueryState.text['#vpnmgr_client_status_1'].indexOf('verified; restored to stopped') != -1);
-	assert.strictEqual(jqueryState.text['#vpnmgr_client_status_1'].indexOf('connected') == -1,true);
+	context.LogApplyStatus(pending,'status',data);
 	jqueryState.ajax = function(options){
 		if(options.url == '/start_apply.htm') options.success('');
 		else if(options.url.indexOf('/runtime/detection_') != -1){
@@ -482,9 +518,128 @@ function testVerifiedStoppedConnectionStatus(){
 			options.success({request:id,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
 		}
 	};
+	context.lastAlert = undefined;
 	context.FinishApplyResult(pending,data);
-	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('restored to stopped') != -1);
-	assert.strictEqual(jqueryState.text['#vpnmgr_apply_summary'].indexOf('currently connected') == -1,true);
+	assert.strictEqual(context.lastAlert,undefined,'verified stopped is a successful outcome');
+	assert.ok(JSON.stringify(consoleSnapshots).indexOf('verified_stopped') != -1,'console reports the truthful verified-stopped state');
+	assert.strictEqual(JSON.stringify(consoleSnapshots).indexOf('currently connected'),-1);
+}
+
+function testMalformedClientKeepsPollingReachable(){
+	var pending = {requestId:'1717171717171717171',phase:'apply',polling:true,startedAt:new Date().getTime()};
+	var malformed = applyResponse(pending.requestId,'running',true);
+	malformed.clients[2] = null;
+	assert.strictEqual(context.ApplyResponseValid(malformed),false,'null client entries are rejected');
+	context.vpnmgr_pendingApply = pending;
+	context.StartApplyOverlay();
+	jqueryState.ajax = function(options){ options.success(malformed); };
+	assert.doesNotThrow(function(){context.PollApplyStatus(pending);},'malformed client entries must not throw during status polling');
+	assert.strictEqual(context.vpnmgr_pendingApply,pending,'malformed status stays pending');
+	assert.strictEqual(pending.polling,true,'polling remains active after malformed status');
+	assert.strictEqual(typeof context.queuedTimer,'function','the next status poll is scheduled');
+	pending.startedAt = 0;
+	context.queuedTimer();
+	assert.strictEqual(pending.polling,false,'deadline remains reachable after malformed status');
+	assert.strictEqual(pending.timedOut,true);
+	assert.strictEqual(loadingState.visible,true,'timeout leaves the native overlay available for recovery');
+	assert.strictEqual(jqueryState.shown['#btnContinueApply'],true);
+	assert.strictEqual(jqueryState.shown['#btnReloadSettings'],true);
+	context.FinishApplyFailure(pending,'Apply test cleanup.');
+}
+
+function testNativeOverlayCleanup(){
+	jqueryState.ajax = function(options){
+		if(options.url == '/start_apply.htm') options.success('inert redirect');
+		else if(options.url.indexOf('/runtime/detection_') != -1){
+			var id = options.url.match(/detection_(\d+)\.json/)[1];
+			options.success({request:id,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
+		}
+	};
+	var initialHideCount = loadingState.hideCalls;
+	var initialReloadCount = context.reloadCount || 0;
+	var success = {requestId:'1818181818181818181',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = success;
+	context.lastAlert = undefined;
+	htmlNode.style.overflow = 'scroll';
+	context.StartApplyOverlay();
+	assert.strictEqual(loadingState.visible,true);
+	assert.strictEqual(htmlNode.style.overflow,'hidden');
+	assert.strictEqual(loadingState.showArguments[loadingState.showArguments.length-1],0,'native firmware loading helper receives no countdown arguments');
+	assert.ok(context.vpnmgr_recoveryRow && context.vpnmgr_recoveryRow.parentNode === loadingTable,'recovery controls are placed in a native loadingBlock table row');
+	var done = applyResponse(success.requestId,'done',true,['unmanaged','unmanaged','unmanaged','unmanaged','unmanaged']);
+	context.FinishApplyResult(success,done);
+	assert.strictEqual(loadingState.visible,false,'successful completion hides the native overlay');
+	assert.strictEqual(loadingState.hideCalls,initialHideCount+1);
+	assert.strictEqual(htmlNode.style.overflow,'scroll','original page scrolling is restored');
+	assert.deepStrictEqual(context.lastScroll,[17,29]);
+	assert.strictEqual(recoveryControls.parentNode,recoveryHome,'static recovery controls return to their home after completion');
+	assert.strictEqual(context.lastAlert,undefined,'success is silent');
+	assert.strictEqual(context.reloadCount,initialReloadCount+1,'confirmed success reloads the page');
+
+	var failure = {requestId:'1919191919191919191',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = failure;
+	context.StartApplyOverlay();
+	var failed = applyResponse(failure.requestId,'done',true,['applied','failed','unmanaged','applied','unmanaged']);
+	failed.clients[1].connection = 'failed';
+	context.FinishApplyResult(failure,failed);
+	assert.strictEqual(loadingState.visible,false,'terminal failure hides the native overlay');
+	assert.ok(context.lastAlert.indexOf('VPN Client 2') != -1,'terminal failure gives a concise user alert');
+	assert.strictEqual(recoveryControls.parentNode,recoveryHome);
+	assert.strictEqual(context.reloadCount,initialReloadCount+1,'partial failure preserves the page and edits');
+
+	var originalHideLoading = context.hideLoading;
+	var missingHide = {requestId:'2121212121212121212',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = missingHide;
+	context.StartApplyOverlay();
+	assert.strictEqual(loadingMask.style.visibility,'visible');
+	context.hideLoading = undefined;
+	context.FinishApplyFailure(missingHide,'Missing hide helper.');
+	context.hideLoading = originalHideLoading;
+	assert.strictEqual(loadingMask.style.visibility,'hidden','fallback cleanup closes the mask if hideLoading is missing');
+}
+
+function testNativeStatusPollingPreserved(){
+	var originalShow = context.showLoading;
+	context.showLoading = function(){ context.window.stopFlag = 1; originalShow(); };
+	for(var i=0; i<2; i++){
+		context.window.stopFlag = i;
+		context.StartApplyOverlay();
+		assert.strictEqual(context.window.stopFlag,i,'native overlay preserves the existing firmware polling flag immediately');
+		context.FinishApplyOverlay();
+	}
+	context.window.stopFlag = 0;
+	context.showLoading = function(){ context.window.stopFlag = 1; throw new Error('fixture helper failure'); };
+	assert.doesNotThrow(function(){context.StartApplyOverlay();});
+	assert.strictEqual(context.window.stopFlag,0,'throwing native helper cannot stop firmware status/autologout polling');
+	context.FinishApplyOverlay();
+	delete context.window.stopFlag;
+	context.showLoading = function(){ originalShow(); };
+	context.StartApplyOverlay();
+	assert.strictEqual(Object.prototype.hasOwnProperty.call(context.window,'stopFlag'),false,'absent firmware flags are left absent');
+	context.FinishApplyOverlay();
+	context.showLoading = originalShow;
+}
+
+function testAllowlistedConsoleSnapshotsAndDedupe(){
+	var pending = {requestId:'2020202020202020202',phase:'apply'};
+	var data = applyResponse(pending.requestId,'running',true);
+	data.password = 'VM_SECRET_PASSWORD_413';
+	data.amng_custom = 'VM_SECRET_SETTINGS_971';
+	data.extra_response_field = 'VM_SECRET_RESPONSE_265';
+	data.clients[0].credential = 'VM_SECRET_CLIENT_804';
+	var start = consoleSnapshots.length;
+	context.LogApplyStatus(pending,'status',data);
+	var afterFirst = consoleSnapshots.length;
+	assert.strictEqual(afterFirst,start+1,'validated status logs one summary snapshot');
+	context.LogApplyStatus(pending,'status',data);
+	assert.strictEqual(consoleSnapshots.length,afterFirst,'identical status snapshots are logged only once');
+	var emitted = JSON.stringify(consoleSnapshots.slice(start));
+	['VM_SECRET_PASSWORD_413','VM_SECRET_SETTINGS_971','VM_SECRET_RESPONSE_265','VM_SECRET_CLIENT_804'].forEach(function(secret){
+		assert.strictEqual(emitted.indexOf(secret),-1,'console snapshot excludes '+secret);
+	});
+	var snapshot = JSON.parse(JSON.stringify(consoleSnapshots[afterFirst-1]));
+	assert.deepStrictEqual(Object.keys(snapshot).sort(),['clients','event','merged','message','phase','request','state'].sort());
+	assert.deepStrictEqual(Object.keys(snapshot.clients[0]).sort(),['connection','slot','status'].sort());
 }
 
 function testLoadedSettingsContract(){
@@ -513,4 +668,8 @@ testRecoveryAfterLostSettingsPost();
 testRecoveryLossAndLateApplyAreUncertainSafe();
 testPartialApplyResult();
 testVerifiedStoppedConnectionStatus();
+testMalformedClientKeepsPollingReachable();
+testNativeOverlayCleanup();
+testNativeStatusPollingPreserved();
+testAllowlistedConsoleSnapshotsAndDedupe();
 process.stdout.write('Web UI contract checks passed.\n');

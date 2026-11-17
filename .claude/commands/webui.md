@@ -60,12 +60,23 @@ a different profile or preset family after a router update.
    leave the form available without submitting settings.
 3. POST the captured main-form fields with `start_vpnmgrapply_<id>` and JSON
    `amng_custom`, including the matching `vpnmgr_request_id`.
-4. Poll only `apply_<id>.json`. Check request/state/client schema, display all
-   five results, and distinguish `merged`, apply status and connection status.
+4. Poll only `apply_<id>.json`. Check request/state/client schema, including null
+   client entries. Keep Merlin's zero-argument `showLoading()` overlay visible
+   while completion is pending. Preserve the firmware status-polling flag
+   synchronously around that helper while waiting or retaining edits on failure.
+   Log detailed results for all five clients to the
+   browser console, distinguishing `merged`, apply status and connection status.
+   Do not add a permanent Apply status panel or expose request IDs on screen.
+   Construct allowlisted diagnostic records; never log payloads, credentials,
+   pending objects or unfiltered responses. Use plain-text console records so
+   users can inspect them after navigation if their browser retains logs.
+   Confirmed success closes the overlay and reloads saved settings;
+   failures also show a concise alert. A terminal `done` can contain failed clients.
 5. Freeze configuration inputs during an outstanding apply, preserving their
    prior disabled states. Restore them at terminal results; retain edits.
    A timeout remains unconfirmed. Continue checking the SAME request without
-   resubmitting; reload saved settings only on an explicit user action.
+   resubmitting. Errors and unconfirmed requests must not auto-reload; Reload is
+   an explicit escape for those cases.
 
 After an apply timeout, Continue checking POSTs `start_vpnmgrrecover_<id>` as a
 control-only request before polling. The backend expires only an unused matching

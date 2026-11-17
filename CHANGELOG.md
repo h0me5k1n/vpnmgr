@@ -17,10 +17,12 @@ empty "## Unreleased" heading; the smoke test rejects one.
 
 - Automatically select NordVPN legacy or modern profiles from the router's built-in OpenVPN version. Report unknown versions explicitly and use the legacy fallback.
 - Separate legacy/modern shared, UDP and TCP custom-settings lists using each client's current provider, transport and logging settings. Choice 7 accepts individual slots, ranges and mixed comma-separated selections.
-- Show backend runtime detection and per-client apply/connection results in the WebUI. Reserve each Save before submitting its payload, retain edits on failures and allow continued checking of an unconfirmed request.
+- Show backend runtime detection in WebUI Utilities and detailed apply/connection outcomes in the browser console. Reserve each Save before submitting its payload, retain edits on failures and allow continued checking of an unconfirmed request.
 
 ### Fixed
 
+- Use Merlin's standard applying-settings overlay and reload after confirmed success, with clear failures and console diagnostics instead of a permanent Apply status panel. Preserve edits and firmware status polling when completion fails or remains unconfirmed.
+- Restore the managed VPN client list and current custom-setting states before Choice 7's batch-selection prompt.
 - Size the CLI banner to fit the version, router model and development source label, using padding compatible with the router's BusyBox awk and keeping its borders aligned for long branch names.
 - Recover a lost WebUI settings POST by expiring only its unused reservation, preserving edits and late/running request correlation without resubmitting settings. Report clients restored to stopped accurately and retain unavailable location IDs only for unchanged selections.
 - Make normal direct installs verify/refetch their own pinned main script before installing dependencies, with automatic NordVPN visibility in pinned test builds. Preserve ordinary `unknown` branch-fallback reentry and the existing `develop`/`stable` switching paths.

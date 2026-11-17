@@ -20,6 +20,195 @@ var vpnmgr_runtime = null;
 var vpnmgr_pendingApply = null;
 var vpnmgr_lastRequestId = '';
 var vpnmgr_runtimePending = null;
+var vpnmgr_lastApplyDiagnostic = '';
+var vpnmgr_lastApplyLog = {};
+var vpnmgr_applyOverlayActive = false;
+var vpnmgr_nativeLoadingActive = false;
+var vpnmgr_savedOverflow = '';
+var vpnmgr_savedScrollX = 0;
+var vpnmgr_savedScrollY = 0;
+var vpnmgr_recoveryRow = null;
+var vpnmgr_recoveryHome = null;
+
+function SafeConsole(method,snapshot){
+	// Plain text remains inspectable after navigation when Preserve log is on.
+	if(typeof console != 'undefined' && console && typeof console[method] == 'function') console[method]('[vpnmgr]',JSON.stringify(snapshot));
+}
+
+function LogSafeUiEvent(area,event){
+	var allowed = {
+		runtime:['request_failed','malformed','timed_out'],
+		settings:['read_failed','malformed'],
+		validation:['invalid_schedule','provider_unavailable','runtime_required','settings_unavailable'],
+		apply:['started','prepare_post_error','reservation_ready','reservation_busy','reservation_failed','reservation_superseded','status_network_error','status_malformed','status_stale','payload_post_error','payload_post_ack','recovery_started','recovery_post_error','recovery_post_ack','overlay_unavailable','timed_out','terminal_success','terminal_failure']
+	};
+	if(!allowed[area] || allowed[area].indexOf(event) == -1) return;
+	SafeConsole('log',{area:area,event:event});
+}
+
+function AlertVpnMgr(message,event){
+	if(event) LogSafeUiEvent('validation',event);
+	alert(message);
+}
+
+function SetApplyDiagnostic(message){
+	vpnmgr_lastApplyDiagnostic = message;
+}
+
+function ApplyRequestIdValid(requestId){ return typeof requestId == 'string' && /^\d{1,32}$/.test(requestId); }
+
+function LogApplyNotice(pending,event,state){
+	if(!pending || !ApplyRequestIdValid(pending.requestId)) return;
+	var states = ['ready','busy','running','done','failed','superseded','expired'];
+	var events = ['started','prepare_post_error','reservation_ready','reservation_busy','reservation_failed','reservation_superseded','status_network_error','status_malformed','status_stale','payload_post_error','payload_post_ack','recovery_started','recovery_post_error','recovery_post_ack','overlay_unavailable','timed_out','terminal_success','terminal_failure'];
+	if(events.indexOf(event) == -1 || (state && states.indexOf(state) == -1)) return;
+	var snapshot = {request:pending.requestId,phase:pending.phase,event:event};
+	if(state) snapshot.state = state;
+	WriteApplySnapshot(snapshot);
+}
+
+function LogApplyStatus(pending,event,data){
+	if(['status','terminal_success','terminal_failure'].indexOf(event) == -1 || !pending || !ApplyRequestIdValid(pending.requestId) || !ApplyResponseValid(data) || data.request !== pending.requestId) return;
+	var snapshot = {request:pending.requestId,phase:pending.phase,event:event,state:data.state,merged:data.merged,message:data.message,clients:[]};
+	for(var i=0; i<data.clients.length; i++) snapshot.clients.push({slot:data.clients[i].slot,status:data.clients[i].status,connection:data.clients[i].connection});
+	WriteApplySnapshot(snapshot);
+}
+
+function WriteApplySnapshot(snapshot){
+	var requestId = snapshot.request;
+	var key = JSON.stringify(snapshot);
+	if(!vpnmgr_lastApplyLog[requestId]) vpnmgr_lastApplyLog[requestId] = {};
+	if(vpnmgr_lastApplyLog[requestId][key]) return;
+	vpnmgr_lastApplyLog[requestId][key] = true;
+	SafeConsole(snapshot.event == 'terminal_failure' ? 'error' : 'log',snapshot);
+}
+
+function SetLoadingCopy(main,detail){
+	var mainElement = document.getElementById && document.getElementById('proceeding_main_txt');
+	var detailElement = document.getElementById && document.getElementById('proceeding_txt');
+	if(mainElement) mainElement.textContent = main;
+	if(detailElement) detailElement.textContent = detail;
+}
+
+function RecoveryControls(){
+	var controls = document.getElementById && document.getElementById('vpnmgr_recovery_controls');
+	if(controls){
+		if(!vpnmgr_recoveryHome) vpnmgr_recoveryHome = document.getElementById('vpnmgr_recovery_placeholder') || controls.parentNode;
+		return controls;
+	}
+	if(!document.createElement || !document.body) return null;
+	controls = document.createElement('div');
+	controls.id = 'vpnmgr_recovery_controls';
+	vpnmgr_recoveryHome = document.body;
+	controls.style.display = 'none';
+	controls.style.position = 'fixed';
+	controls.style.zIndex = '10001';
+	controls.style.left = '50%';
+	controls.style.top = '50%';
+	controls.style.transform = 'translate(-50%,-50%)';
+	controls.style.padding = '16px';
+	controls.style.backgroundColor = '#1F2D35';
+	controls.style.color = '#FFFFFF';
+	controls.style.textAlign = 'center';
+	var notice = document.createElement('div');
+	notice.id = 'vpnmgr_recovery_notice';
+	controls.appendChild(notice);
+	var cont = document.createElement('button');
+	cont.type = 'button'; cont.id = 'btnContinueApply'; cont.textContent = 'Continue checking'; cont.onclick = ContinueApplyChecking; cont.style.display = 'none';
+	controls.appendChild(cont);
+	var reloadButton = document.createElement('button');
+	reloadButton.type = 'button'; reloadButton.id = 'btnReloadSettings'; reloadButton.textContent = 'Reload saved settings'; reloadButton.onclick = reload; reloadButton.style.display = 'none';
+	controls.appendChild(reloadButton);
+	document.body.appendChild(controls);
+	return controls;
+}
+
+function PlaceRecoveryControls(){
+	var controls = RecoveryControls();
+	var loadingTable = document.getElementById && document.getElementById('loadingBlock');
+	if(controls && vpnmgr_nativeLoadingActive && loadingTable && String(loadingTable.tagName).toUpperCase() == 'TABLE' && loadingTable.insertRow){
+		if(!vpnmgr_recoveryRow){
+			vpnmgr_recoveryRow = loadingTable.insertRow(-1);
+			var cell = vpnmgr_recoveryRow.insertCell(-1);
+			cell.colSpan = 2;
+			cell.appendChild(controls);
+		}
+		return true;
+	}
+	if(controls && document.body && controls.parentNode !== document.body) document.body.appendChild(controls);
+	return false;
+}
+
+function SetRecoveryControlsVisible(visible){
+	var controls = RecoveryControls();
+	if(!controls) return;
+	if(visible && !PlaceRecoveryControls()){
+		controls.style.position = 'fixed'; controls.style.zIndex = '10001'; controls.style.left = '50%'; controls.style.top = '50%'; controls.style.transform = 'translate(-50%,-50%)';
+		controls.style.padding = '16px'; controls.style.backgroundColor = '#1F2D35'; controls.style.color = '#FFFFFF'; controls.style.textAlign = 'center';
+	}
+	controls.style.display = visible ? 'block' : 'none';
+}
+
+function StartApplyOverlay(){
+	if(vpnmgr_applyOverlayActive) return;
+	vpnmgr_applyOverlayActive = true;
+	vpnmgr_savedOverflow = document.documentElement && document.documentElement.style ? document.documentElement.style.overflow : '';
+	vpnmgr_savedScrollX = window.pageXOffset || 0;
+	vpnmgr_savedScrollY = window.pageYOffset || 0;
+	vpnmgr_nativeLoadingActive = false;
+	var hadStopFlag = typeof window.stopFlag != 'undefined';
+	var savedStopFlag = window.stopFlag;
+	try{
+		if(typeof showLoading == 'function'){
+			showLoading();
+			vpnmgr_nativeLoadingActive = true;
+		}
+	}catch(error){
+		LogApplyNotice(vpnmgr_pendingApply,'overlay_unavailable');
+	}finally{
+		// Keep firmware status/autologout polling active while waiting and when
+		// an error leaves this page open. Do not restart or duplicate its loop.
+		if(hadStopFlag) window.stopFlag = savedStopFlag;
+	}
+	SetLoadingCopy('Please wait,','Applying settings...');
+	PlaceRecoveryControls();
+	if(!vpnmgr_nativeLoadingActive){
+		var notice = document.getElementById && document.getElementById('vpnmgr_recovery_notice');
+		if(notice) notice.textContent = 'Applying settings. Please wait.';
+		SetRecoveryControlsVisible(true);
+	}
+}
+
+function FinishApplyOverlay(){
+	var wasActive = vpnmgr_applyOverlayActive;
+	if(vpnmgr_applyOverlayActive && typeof hideLoading == 'function'){
+		try{ hideLoading(); }catch(error){ LogSafeUiEvent('apply','overlay_unavailable'); }
+	}
+	var loadingElement = document.getElementById && document.getElementById('Loading');
+	if(wasActive && loadingElement && loadingElement.style && loadingElement.style.visibility == 'visible') loadingElement.style.visibility = 'hidden';
+	SetRecoveryControlsVisible(false);
+	var controls = RecoveryControls();
+	if(controls && vpnmgr_recoveryHome && typeof vpnmgr_recoveryHome.appendChild == 'function' && controls.parentNode !== vpnmgr_recoveryHome) vpnmgr_recoveryHome.appendChild(controls);
+	if(controls){
+		controls.style.position = ''; controls.style.zIndex = ''; controls.style.left = ''; controls.style.top = ''; controls.style.transform = '';
+		controls.style.padding = ''; controls.style.backgroundColor = ''; controls.style.color = ''; controls.style.textAlign = '';
+	}
+	if(vpnmgr_recoveryRow && vpnmgr_recoveryRow.parentNode) vpnmgr_recoveryRow.parentNode.removeChild(vpnmgr_recoveryRow);
+	vpnmgr_recoveryRow = null;
+	if(wasActive && document.documentElement && document.documentElement.style) document.documentElement.style.overflow = vpnmgr_savedOverflow;
+	if(wasActive && window.scrollTo) window.scrollTo(vpnmgr_savedScrollX,vpnmgr_savedScrollY);
+	vpnmgr_applyOverlayActive = false;
+	vpnmgr_nativeLoadingActive = false;
+}
+
+function ShowRecoveryControls(message){
+	var notice = document.getElementById && document.getElementById('vpnmgr_recovery_notice');
+	if(notice) notice.textContent = message;
+	SetLoadingCopy('Please wait,','Choose an action below.');
+	SetRecoveryControlsVisible(true);
+	$j('#btnContinueApply').show();
+	$j('#btnReloadSettings').show();
+}
 
 function SetText(selector,text){
 	$j(selector).text(text);
@@ -69,7 +258,7 @@ function DetectRuntime(){
 		dataType:'text',
 		cache:false,
 		timeout:15000,
-		error:function(){ BeginRuntimePolling(pending); },
+		error:function(){ LogRuntimeFailureOnce(pending,'request_failed'); BeginRuntimePolling(pending); },
 		success:function(){ BeginRuntimePolling(pending); }
 	});
 }
@@ -78,6 +267,12 @@ function BeginRuntimePolling(pending){
 	if(vpnmgr_runtimePending !== pending || pending.polling) return;
 	pending.polling = true;
 	PollRuntimeStatus(pending);
+}
+
+function LogRuntimeFailureOnce(pending,event){
+	if(!pending || pending.lastLoggedError == event) return;
+	pending.lastLoggedError = event;
+	LogSafeUiEvent('runtime',event);
 }
 
 function PollRuntimeStatus(pending){
@@ -91,6 +286,7 @@ function PollRuntimeStatus(pending){
 		dataType:'json',cache:false,timeout:10000,
 		error:function(){
 			if(vpnmgr_runtimePending !== pending || !pending.polling) return;
+			LogRuntimeFailureOnce(pending,'request_failed');
 			setTimeout(function(){PollRuntimeStatus(pending);},2000);
 		},
 		success:function(data){
@@ -121,6 +317,7 @@ function PollRuntimeStatus(pending){
 
 function FinishRuntimeFailure(pending,message){
 	if(vpnmgr_runtimePending !== pending) return;
+	LogSafeUiEvent('runtime',message.indexOf('timed out') != -1 ? 'timed_out' : 'malformed');
 	pending.polling = false;
 	vpnmgr_runtimePending = null;
 	vpnmgr_runtimeState = 'failed';
@@ -448,7 +645,7 @@ function Validate_All(){
 		}
 	}
 	if(validationfailed){
-		alert('Validation for some fields failed. Please correct invalid values and try again.');
+		AlertVpnMgr('Validation for some fields failed. Please correct invalid values and try again.','invalid_schedule');
 		return false;
 	}
 	else{
@@ -483,6 +680,7 @@ function get_conf_file(){
 		timeout: 15000,
 		error: function(xhr){
 			vpnmgr_configState = 'failed';
+			LogSafeUiEvent('settings','read_failed');
 			SetText('#vpnmgr_config_status','Settings could not be loaded. Existing form values have been preserved.');
 			$j('#btnConfigRetry').show();
 			CanSaveConfig();
@@ -490,6 +688,7 @@ function get_conf_file(){
 		success: function(data){
 			if(typeof data != 'string' || data.indexOf('=') == -1){
 				vpnmgr_configState = 'failed';
+				LogSafeUiEvent('settings','malformed');
 				SetText('#vpnmgr_config_status','Settings response was empty or malformed. Existing form values have been preserved.');
 				$j('#btnConfigRetry').show();
 				CanSaveConfig();
@@ -511,6 +710,7 @@ function get_conf_file(){
 			}
 			if(!LoadedSettingsValid(window['vpnmgr_settings'])){
 				vpnmgr_configState = 'failed';
+				LogSafeUiEvent('settings','malformed');
 				SetText('#vpnmgr_config_status','Settings response was incomplete or malformed. Existing form values have been preserved.');
 				$j('#btnConfigRetry').show();
 				CanSaveConfig();
@@ -677,11 +877,11 @@ function pass_checked(obj,showobj){
 function SaveConfig(){
 	CanSaveConfig();
 	if (!vpnmgr_initComplete || vpnmgr_configState != 'loaded') {
-		alert('Settings have not loaded successfully yet. Retry the settings load before saving.');
+		AlertVpnMgr('Settings have not loaded successfully yet. Retry the settings load before saving.','settings_unavailable');
 		return false;
 	}
 	if(vpnmgr_runtimeState != 'known' && vpnmgr_runtimeState != 'unknown'){
-		alert('A valid router OpenVPN runtime check is required before saving. Retry the runtime check first.');
+		AlertVpnMgr('A valid router OpenVPN runtime check is required before saving. Retry the runtime check first.','runtime_required');
 		return false;
 	}
 	if(vpnmgr_pendingApply) return false;
@@ -709,7 +909,7 @@ function SaveConfig(){
 			var providerInput = $j('input[name="vpnmgr_vpn'+slot+'_provider"]:checked')[0];
 			var managedInput = $j('input[name="vpnmgr_vpn'+slot+'_managed"]:checked')[0];
 			if(managedInput && managedInput.value == 'true' && (!providerInput || !IsProviderAvailable(providerInput.value))){
-				alert('VPN Client '+slot+' uses a provider that is unavailable in providers.htm. Select an available provider or disable management for this client before saving.');
+				AlertVpnMgr('VPN Client '+slot+' uses a provider that is unavailable in providers.htm. Select an available provider or disable management for this client before saving.','provider_unavailable');
 				return false;
 			}
 		}
@@ -718,11 +918,12 @@ function SaveConfig(){
 		var fields = CollectFormFields('start_vpnmgrapply_'+requestId,payload);
 		vpnmgr_pendingApply = {requestId:requestId,payload:payload,fields:fields,phase:'prepare',startedAt:0,polling:false};
 		FreezeConfigControls(vpnmgr_pendingApply);
-		SetApplySummary('Reserving a settings apply (request '+requestId+').');
-		for(var client=1; client<=5; client++) SetText('#vpnmgr_client_status_'+client,'waiting');
+		SetApplyDiagnostic('Reserving settings apply.');
 		$j('#btnReloadSettings').hide();
 		$j('#btnContinueApply').hide();
 		CanSaveConfig();
+		LogApplyNotice(vpnmgr_pendingApply,'started');
+		StartApplyOverlay();
 		PrepareApply(vpnmgr_pendingApply);
 	}
 	else{
@@ -840,7 +1041,7 @@ function PrepareApply(pending){
 	for(var i=0; i<fields.length; i++) if(fields[i].name == 'action_script') fields[i].value = 'start_vpnmgrprepare_'+pending.requestId;
 	$j.ajax({
 		url:'/start_apply.htm',method:'POST',type:'POST',data:fields,dataType:'text',cache:false,timeout:15000,
-		error:function(){ SetApplySummary('Could not confirm the reservation request. Checking its status.'); BeginApplyPolling(pending,'prepare'); },
+		error:function(){ LogApplyNotice(pending,'prepare_post_error'); SetApplyDiagnostic('Reservation POST was not confirmed.'); BeginApplyPolling(pending,'prepare'); },
 		success:function(){ BeginApplyPolling(pending,'prepare'); }
 	});
 }
@@ -861,24 +1062,29 @@ function ContinueApplyChecking(){
 		RecoverApplyReservation(pending);
 		return;
 	}
+	SetLoadingCopy('Please wait,','Checking the same request.');
 	BeginApplyPolling(pending,pending.phase);
 }
 
 function RecoverApplyReservation(pending){
 	if(vpnmgr_pendingApply !== pending || pending.polling || pending.recovering) return;
 	pending.recovering = true;
-	SetApplySummary('Checking whether the same request is still an unused reservation. Running or completed work will remain unchanged.');
+	SetApplyDiagnostic('Checking the same request reservation.');
+	SetLoadingCopy('Please wait,','The same request is being checked.');
+	LogApplyNotice(pending,'recovery_started');
 	var fields = $j(document.formScriptActions).serializeArray();
 	for(var i=0; i<fields.length; i++) if(fields[i].name == 'action_script') fields[i].value = 'start_vpnmgrrecover_'+pending.requestId;
 	$j.ajax({
 		url:'/start_apply.htm',type:'POST',data:fields,dataType:'text',cache:false,timeout:15000,
 		error:function(){
 			if(vpnmgr_pendingApply !== pending || !pending.recovering) return;
+			LogApplyNotice(pending,'recovery_post_error');
 			pending.recovering = false;
 			BeginApplyPolling(pending,'apply');
 		},
 		success:function(){
 			if(vpnmgr_pendingApply !== pending || !pending.recovering) return;
+			LogApplyNotice(pending,'recovery_post_ack');
 			pending.recovering = false;
 			BeginApplyPolling(pending,'apply');
 		}
@@ -890,7 +1096,9 @@ function PollApplyStatus(pending){
 	if(new Date().getTime()-pending.startedAt >= 120000){
 		pending.polling = false;
 		pending.timedOut = true;
-		SetApplySummary(pending.phase == 'apply' ? 'Apply status is unconfirmed. Continue checking asks the backend to expire this request only if it is still an unused reservation; running or completed work is not cancelled. Reload saved settings is available if you need to leave this page.' : 'Completion is not confirmed yet. The same request remains active; continue checking to view its status.');
+		LogApplyNotice(pending,'timed_out');
+		SetApplyDiagnostic('Completion is unconfirmed.');
+		ShowRecoveryControls('Apply status is unconfirmed. Continue checking the same request, or reload saved settings.');
 		$j('#btnContinueApply').show();
 		$j('#btnReloadSettings').show();
 		return;
@@ -900,38 +1108,49 @@ function PollApplyStatus(pending){
 		dataType:'json',cache:false,timeout:10000,
 		error:function(){
 			if(vpnmgr_pendingApply !== pending || !pending.polling) return;
+			LogApplyNotice(pending,'status_network_error');
 			setTimeout(function(){PollApplyStatus(pending);},2000);
 		},
 		success:function(data){
 			if(vpnmgr_pendingApply !== pending || !pending.polling) return;
 			if(!data || typeof data != 'object' || data.request !== pending.requestId || typeof data.state != 'string'){
-				SetApplySummary('Received a malformed or stale apply status; checking the same request again.');
+				var staleStatus = data && typeof data == 'object' && data.request !== pending.requestId;
+				LogApplyNotice(pending,staleStatus ? 'status_stale' : 'status_malformed');
+				SetApplyDiagnostic('Malformed or stale status; polling continues.');
 				setTimeout(function(){PollApplyStatus(pending);},2000);
 				return;
 			}
 			if(pending.phase == 'prepare'){
 				if(data.state == 'ready'){
 					pending.polling = false;
+					LogApplyNotice(pending,'reservation_ready','ready');
 					PostPreparedApply(pending);
 					return;
 				}
 				if(data.state == 'busy' || data.state == 'superseded' || data.state == 'failed'){
-					FinishApplyFailure(pending,'Settings were not submitted: reservation '+data.state+'.');
+					var prepareEvents = {busy:'reservation_busy',superseded:'reservation_superseded',failed:'reservation_failed'};
+					LogApplyNotice(pending,prepareEvents[data.state],data.state);
+					var prepareMessages = {busy:'Another save is in progress. Your settings were not submitted.',superseded:'A newer save request replaced this one. Your settings were not submitted.',failed:'Settings could not be saved because the reservation failed. No settings were submitted.'};
+					FinishApplyFailure(pending,prepareMessages[data.state],prepareEvents[data.state]);
 					return;
 				}
+				LogApplyNotice(pending,'status_malformed');
+				SetApplyDiagnostic('Malformed reservation status; polling continues.');
 			}
 			else if(data.state == 'ready'){
-				SetApplySummary('This request is still reserved and its settings submission is unconfirmed. No settings were resubmitted; continue checking after the reservation becomes recoverable.');
+				LogApplyNotice(pending,'status_malformed','ready');
+				SetApplyDiagnostic('The same request remains reserved; settings were not resubmitted.');
 			}
 			else if(ApplyResponseValid(data)){
-				RenderApplyStatus(data);
+				LogApplyStatus(pending,'status',data);
 				if(data.state == 'done' || data.state == 'failed' || data.state == 'superseded'){
 					FinishApplyResult(pending,data);
 					return;
 				}
 			}
 			else{
-				SetApplySummary('Received a malformed apply status; checking the same request again.');
+				LogApplyNotice(pending,'status_malformed');
+				SetApplyDiagnostic('Malformed apply status; polling continues.');
 			}
 			setTimeout(function(){PollApplyStatus(pending);},2000);
 		}
@@ -939,12 +1158,15 @@ function PollApplyStatus(pending){
 }
 
 function ApplyResponseValid(data){
-	if(data.state != 'running' && data.state != 'done' && data.state != 'failed' && data.state != 'superseded') return false;
-	if(typeof data.merged != 'boolean' || !data.clients || data.clients.length != 5) return false;
+	if(!data || typeof data != 'object' || !ApplyRequestIdValid(data.request)) return false;
+	if(typeof data.state != 'string' || ['running','done','failed','superseded'].indexOf(data.state) == -1) return false;
+	if(typeof data.merged != 'boolean' || !Array.isArray(data.clients) || data.clients.length != 5) return false;
 	if(['ready','busy','running','expired','nonce_mismatch','unreserved','superseded','snapshot_failed','merge_failed','status_failed','interrupted','complete'].indexOf(data.message) == -1) return false;
 	for(var i=0; i<5; i++){
-		if(data.clients[i].slot != i+1 || ['pending','applying','applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1 || ['not_requested','connected','verified_stopped','failed','unknown'].indexOf(data.clients[i].connection) == -1) return false;
-		if(data.state == 'done' && ['applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1) return false;
+		var client = data.clients[i];
+		if(!client || typeof client != 'object' || Object.prototype.toString.call(client) != '[object Object]') return false;
+		if(client.slot !== i+1 || ['pending','applying','applied','failed','unmanaged'].indexOf(client.status) == -1 || ['not_requested','connected','verified_stopped','failed','unknown'].indexOf(client.connection) == -1) return false;
+		if(data.state == 'done' && ['applied','failed','unmanaged'].indexOf(client.status) == -1) return false;
 	}
 	return true;
 }
@@ -952,17 +1174,13 @@ function ApplyResponseValid(data){
 function PostPreparedApply(pending){
 	if(vpnmgr_pendingApply !== pending) return;
 	pending.phase = 'apply';
-	SetApplySummary('Settings submitted. Waiting for all client apply results (request '+pending.requestId+').');
+	SetApplyDiagnostic('Settings payload submitted; waiting for authoritative apply status.');
+	SetLoadingCopy('Please wait,','Applying settings...');
 	$j.ajax({
 		url:'/start_apply.htm',method:'POST',type:'POST',data:pending.fields,dataType:'text',cache:false,timeout:20000,
-		error:function(){ BeginApplyPolling(pending,'apply'); },
-		success:function(){ BeginApplyPolling(pending,'apply'); }
+		error:function(){ LogApplyNotice(pending,'payload_post_error'); BeginApplyPolling(pending,'apply'); },
+		success:function(){ LogApplyNotice(pending,'payload_post_ack'); BeginApplyPolling(pending,'apply'); }
 	});
-}
-
-function RenderApplyStatus(data){
-	for(var i=0; i<data.clients.length; i++) SetText('#vpnmgr_client_status_'+(i+1),data.clients[i].status+'; '+ConnectionStatusLabel(data.clients[i].connection));
-	if(data.state == 'running') SetApplySummary('Apply in progress for request '+data.request+'.');
 }
 
 function ConnectionStatusLabel(connection){
@@ -971,19 +1189,21 @@ function ConnectionStatusLabel(connection){
 }
 
 function ApplyMessageLabel(code){
-	var messages = {ready:'ready',busy:'another apply is active',running:'running',expired:'reservation expired',nonce_mismatch:'request ID did not match the submitted settings',unreserved:'no reservation exists',superseded:'superseded by a newer request',snapshot_failed:'settings snapshot failed',merge_failed:'settings merge failed',status_failed:'status could not be written',interrupted:'apply was interrupted',complete:'complete'};
-	return messages[code] || 'reported '+code;
+	var messages = {ready:'ready',busy:'another save is in progress',running:'still in progress',expired:'the save request expired',nonce_mismatch:'the settings did not match this save request',unreserved:'no save reservation was available',superseded:'a newer save request replaced this one',snapshot_failed:'the settings could not be captured',merge_failed:'the settings could not be saved',status_failed:'the apply result could not be recorded',interrupted:'the apply was interrupted',complete:'complete'};
+	return messages[code] || 'could not be confirmed';
 }
 
-function FinishApplyFailure(pending,message){
+function FinishApplyFailure(pending,message,event){
 	if(vpnmgr_pendingApply !== pending) return;
 	pending.polling = false;
 	RestoreConfigControls(pending);
 	vpnmgr_pendingApply = null;
-	SetApplySummary(message+' You can correct the form and save again.');
-	$j('#btnContinueApply').hide();
-	$j('#btnReloadSettings').hide();
+	SetApplyDiagnostic(message);
+	FinishApplyOverlay();
+	if(event) LogApplyNotice(pending,event,pending.phase == 'prepare' ? (event == 'reservation_busy' ? 'busy' : event == 'reservation_superseded' ? 'superseded' : event == 'reservation_failed' ? 'failed' : undefined) : undefined);
+	LogApplyNotice(pending,'terminal_failure');
 	CanSaveConfig();
+	alert(message+' You can try again after checking the status.');
 }
 
 function FinishApplyResult(pending,data){
@@ -992,32 +1212,42 @@ function FinishApplyResult(pending,data){
 	RestoreConfigControls(pending);
 	vpnmgr_pendingApply = null;
 	var failed = [];
-	for(var i=0; i<data.clients.length; i++) if(data.clients[i].status == 'failed' || (data.clients[i].status == 'applied' && data.clients[i].connection == 'failed')) failed.push(i+1);
-	var connectionUnknown = false;
-	var verifiedStopped = false;
-	for(var c=0; c<data.clients.length; c++){
-		if(data.clients[c].status == 'applied' && data.clients[c].connection == 'verified_stopped') verifiedStopped = true;
-		else if(data.clients[c].status == 'applied' && data.clients[c].connection != 'connected') connectionUnknown = true;
+	var uncertain = [];
+	for(var i=0; i<data.clients.length; i++){
+		if(data.clients[i].status == 'failed' || (data.clients[i].status == 'applied' && data.clients[i].connection == 'failed')) failed.push(i+1);
+		else if(data.clients[i].status == 'applied' && ['connected','verified_stopped','not_requested'].indexOf(data.clients[i].connection) == -1) uncertain.push(i+1);
 	}
+	var terminalFailure = false;
+	var alertMessage = '';
 	if(data.merged && data.state != 'done'){
-		SetApplySummary('Settings saved, but apply ended as '+data.state+' ('+ApplyMessageLabel(data.message)+'). Review the per-client results.');
+		terminalFailure = true;
+		alertMessage = 'Settings were saved, but applying them did not complete. Check the browser console for client result details.';
 	}
 	else if(data.merged && failed.length){
-		SetApplySummary('Settings saved, but apply failed for VPN Client '+failed.join(', ')+'. '+ApplyMessageLabel(data.message)+'.');
+		terminalFailure = true;
+		alertMessage = 'Settings were saved, but applying settings failed for VPN Client '+failed.join(', ')+'. Check the browser console for details.';
+	}
+	else if(data.merged && uncertain.length){
+		terminalFailure = true;
+		alertMessage = 'Settings were saved, but the connection result could not be confirmed for VPN Client '+uncertain.join(', ')+'. Check the browser console for details.';
 	}
 	else if(data.merged){
-		SetApplySummary(connectionUnknown ? 'Settings saved. Apply completed; review the per-client connection results.' : verifiedStopped ? 'Settings saved. Apply completed; stopped clients were verified and restored to stopped.' : 'Settings saved. All managed client applies completed successfully.');
+		SetApplyDiagnostic('Settings saved and apply completed.');
 	}
 	else{
-		SetApplySummary('Settings were not merged. '+ApplyMessageLabel(data.message)+'. Correct the form and save again.');
+		terminalFailure = true;
+		alertMessage = 'Settings were not saved because '+ApplyMessageLabel(data.message)+'. Review the settings and try again.';
 	}
-	$j('#btnContinueApply').hide();
-	$j('#btnReloadSettings').show();
+	if(terminalFailure) SetApplyDiagnostic(alertMessage);
+	FinishApplyOverlay();
+	LogApplyStatus(pending,terminalFailure ? 'terminal_failure' : 'terminal_success',data);
 	CanSaveConfig();
-	DetectRuntime();
+	if(terminalFailure){
+		DetectRuntime();
+		alert(alertMessage);
+	}
+	else reload();
 }
-
-function SetApplySummary(message){ SetText('#vpnmgr_apply_summary',message); }
 
 function initial(){
 	SetCurrentPage();

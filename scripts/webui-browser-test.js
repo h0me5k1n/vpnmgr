@@ -1,7 +1,7 @@
 'use strict';
 
-// One isolated Chrome session against loopback fixtures; never contacts a router.
-// Requires an existing compatible Chrome/ChromeDriver, with no package installs.
+// One isolated Chrome or Firefox session against loopback fixtures; never contacts a router.
+// Requires an existing compatible browser/driver, with no package installs.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -12,18 +12,38 @@ const root = path.resolve(__dirname, '..');
 const template = fs.readFileSync(path.join(root, 'vpnmgr_www.asp'), 'utf8');
 const jquery = fs.readFileSync(path.join(root, 'www/jquery.js'));
 const script = fs.readFileSync(path.join(root, 'vpnmgr_www.js'));
+const nativePopupPath = process.env.MERLIN_POPUP_JS;
+const nativePopup = nativePopupPath ? fs.readFileSync(path.resolve(nativePopupPath)) : null;
+const browserType = String(process.env.WEBUI_BROWSER || 'chrome').toLowerCase();
+if (!['chrome','firefox'].includes(browserType)) throw new Error('WEBUI_BROWSER must be chrome or firefox');
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'vpnmgr-browser-'));
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const started = Date.now();
-let state, session, driver, driverUrl, pageUrl;
-const firmware = `window.fixtureErrors=[];window.fixtureAlerts=[];
+let state, session, driver, driverUrl, pageUrl, bidiSocket;
+const bidiLogs = [];
+const bidiPending = new Map();
+let bidiCommandId = 0;
+const firmware = `window.fixtureErrors=[];window.fixtureAlerts=[];window.fixtureShowLoadingArgs=[];window.fixtureLoadingVisible=false;
 window.addEventListener('error',function(e){fixtureErrors.push(e.message);});
-window.alert=function(s){fixtureAlerts.push(s);};
-window.show_menu=function(){};window.showLoading=function(){};
+window.alert=function(s){fixtureAlerts.push(s);};window.stopFlag=0;
+window.show_menu=function(){
+  var mask=document.getElementById('Loading');
+  if(!mask||document.getElementById('loadingBlock'))return;
+  var table=document.createElement('table');table.id='loadingBlock';table.className='loadingBlock';
+  var row=table.insertRow(-1);var imageCell=row.insertCell(-1);imageCell.style.width='20%';
+  var image=document.createElement('img');image.src='/images/loading.gif';image.alt='';imageCell.appendChild(image);
+  var textCell=row.insertCell(-1);var main=document.createElement('div');main.id='proceeding_main_txt';main.textContent='Please wait';textCell.appendChild(main);
+  var detail=document.createElement('div');detail.id='proceeding_txt';textCell.appendChild(detail);mask.appendChild(table);
+};
+${nativePopup ? '' : `window.showLoading=function(){fixtureShowLoadingArgs.push(arguments.length);disableCheckChangedStatus();if(window.scrollTo)window.scrollTo(0,0);document.documentElement.style.overflow='hidden';var mask=document.getElementById('Loading');if(mask)mask.style.visibility='visible';fixtureLoadingVisible=true;};
+window.hideLoading=function(){var mask=document.getElementById('Loading');if(mask)mask.style.visibility='hidden';document.documentElement.style.overflow='';fixtureLoadingVisible=false;};`}
 window.showhide=function(id,show){var e=document.getElementById(id);if(e)e.style.display=show?'':'none';};
 window.cookie={get:function(){return null;},set:function(){}};
 window.nd=function(){};window.overlib=function(){};
-window.switchType=function(e,checked){e.type=checked?'text':'password';};`;
+window.switchType=function(e,checked){e.type=checked?'text':'password';};
+window.fixtureInstallLoadingStyles=function(){var style=document.createElement('style');style.textContent='.popup_bg{position:absolute;top:0;left:0;width:100%;height:100%;z-index:9999;background:#444F53;opacity:.94;visibility:hidden;overflow:hidden}.loadingBlock{position:absolute;width:400px;font-size:20px;color:white;font-weight:bold;background:black;border-radius:10px;top:0;z-index:200}';document.head.appendChild(style);};
+window.fixtureInstallLoadingStyles();`;
+const general = `window.showtext=function(element,text){if(element)element.innerHTML=text;};window.translate=function(text){return text;};window.re_mode='0';window.disableCheckChangedStatus=function(){window.stopFlag=1;};`;
 
 function fixture(version = '2.6.12') {
   const config = {};
@@ -52,10 +72,12 @@ const server = http.createServer(async (req,res) => {
   try {
     const url = new URL(req.url,'http://127.0.0.1');
     const pathname = url.pathname;
-    if (pathname === '/vpnmgr.asp') return respond(res,200,render(),'text/html');
+    if (pathname === '/vpnmgr.asp') { state.pageLoads=(state.pageLoads || 0)+1; return respond(res,200,render(),'text/html'); }
     if (pathname === '/ext/vpnmgr/www/jquery.js') return respond(res,200,jquery,'application/javascript');
     if (pathname === '/ext/vpnmgr/vpnmgr_www.js') return respond(res,200,script,'application/javascript');
     if (pathname === '/state.js') return respond(res,200,firmware,'application/javascript');
+    if (pathname === '/general.js') return respond(res,200,general,'application/javascript');
+    if (pathname === '/popup.js') return respond(res,200,nativePopup || '', 'application/javascript');
     if (pathname === '/ext/vpnmgr/providers.htm') return respond(res,200,state.providers);
     if (pathname === '/ext/vpnmgr/nordvpn_countrydata.htm') return respond(res,200,JSON.stringify([{id:13,name:'Australia',cities:[{id:100,name:'Sydney'}]},{id:14,name:'Canada',cities:[{id:200,name:'Toronto'}]}]),'application/json');
     if (pathname === '/ext/vpnmgr/pia_countrydata.htm') return respond(res,200,'AU_Sydney\nUK_London\n');
@@ -130,16 +152,48 @@ async function wd(method, suffix, body) {
   return data.value;
 }
 const execute = scriptText => wd('POST','/execute/sync',{script:scriptText,args:[]});
+function connectBiDi(socketUrl) {
+  return new Promise((resolve,reject) => {
+    bidiSocket = new WebSocket(socketUrl);
+    bidiSocket.addEventListener('open',resolve,{once:true});
+    bidiSocket.addEventListener('error',reject,{once:true});
+    bidiSocket.addEventListener('message',event => {
+      let message;
+      try { message = JSON.parse(event.data); } catch (_) { return; }
+      if (message.id !== undefined && bidiPending.has(message.id)) {
+        const pending = bidiPending.get(message.id);
+        bidiPending.delete(message.id);
+        if (message.type === 'error') pending.reject(new Error(message.message || message.error));
+        else pending.resolve(message.result);
+      }
+      if (message.method === 'log.entryAdded' && message.params) {
+        bidiLogs.push({text:String(message.params.text || ''),level:String(message.params.level || ''),type:String(message.params.type || '')});
+      }
+    });
+  });
+}
+function sendBiDi(method,params) {
+  const id = ++bidiCommandId;
+  return new Promise((resolve,reject) => {
+    const timeout = setTimeout(() => { bidiPending.delete(id); reject(new Error('WebDriver BiDi command timed out: '+method)); },5000);
+    bidiPending.set(id,{resolve:function(result){clearTimeout(timeout);resolve(result);},reject:function(error){clearTimeout(timeout);reject(error);}});
+    bidiSocket.send(JSON.stringify({id,method,params}));
+  });
+}
+async function browserConsoleMessages() {
+  if (browserType === 'firefox') return bidiLogs.map(entry => entry.text);
+  return (await wd('POST','/log',{type:'browser'})).map(entry => entry.message);
+}
 async function until(expression, label, limit = 15000) {
   const deadline = Date.now()+limit;
   while (Date.now() < deadline) {
     if (state.serverError) throw new Error(state.serverError);
     const errors = await execute('return window.fixtureErrors || []');
-    assert.deepEqual(errors,[],label+' JavaScript errors');
+    if (errors !== null) assert.deepEqual(errors,[],label+' JavaScript errors');
     if (await execute('return !!('+expression+')')) return;
     await pause(100);
   }
-  throw new Error('Timed out: '+label+'; '+await execute('return JSON.stringify({config:window.vpnmgr_configState,runtime:window.vpnmgr_runtimeState,summary:document.querySelector("#vpnmgr_apply_summary").textContent,alerts:window.fixtureAlerts})'));
+  throw new Error('Timed out: '+label+'; '+await execute('return JSON.stringify({config:window.vpnmgr_configState,runtime:window.vpnmgr_runtimeState,apply:window.vpnmgr_lastApplyDiagnostic,loading:document.querySelector("#Loading").style.visibility,alerts:window.fixtureAlerts})'));
 }
 async function untilHost(predicate, label, limit = 15000) {
   const deadline = Date.now()+limit;
@@ -154,13 +208,39 @@ async function load() {
   await wd('POST','/url',{url:pageUrl});
   await until('window.vpnmgr_initComplete && !document.querySelector("#btnSaveConfig").disabled','page ready');
   assert.equal(await execute('return document.querySelectorAll("[id^=table_config_vpn]").length'),5);
+  assert.equal(await execute('return !!document.querySelector("#vpnmgr_runtime_status").closest("#table_scripttools")'),true,'runtime readout remains in Utilities');
+  assert.equal(await execute('return !!document.querySelector("#vpnmgr_config_status").closest("#table_runtime_status")'),true,'saved-settings load status stays in its original table');
+  assert.equal(await execute('return document.querySelector("#vpnmgr_apply_summary") === null && document.querySelector("#vpnmgr_client_status") === null'),true,'permanent apply and client status rows are removed');
 }
 async function click(selector) {
   await execute('document.querySelector('+JSON.stringify(selector)+').click();');
 }
+async function clickVisible(selector) {
+  const element = await wd('POST','/element',{using:'css selector',value:selector});
+  const id = element['element-6066-11e4-a52e-4f735466cecf'] || element.ELEMENT;
+  assert.ok(id,'visible control exists: '+selector);
+  await wd('POST','/element/'+id+'/click',{});
+}
 async function save() {
-  await click('#btnSaveConfig');
-  await until('!window.vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','apply terminal');
+	const pageLoadsBefore = state.pageLoads;
+  // Observe the synchronous click before a fast fixture can finish its AJAX
+  // round trips. No artificial production delay is needed to see the overlay.
+  const started = await execute('document.querySelector("#btnSaveConfig").click();return {active:window.vpnmgr_applyOverlayActive,visible:document.querySelector("#Loading").style.visibility === "visible",untimed:window.fixtureShowLoadingArgs.length ? window.fixtureShowLoadingArgs[window.fixtureShowLoadingArgs.length-1] === 0 : document.querySelector("#proceeding_main_txt").textContent.indexOf("Please wait") !== -1,controls:document.querySelector("#loadingBlock").contains(document.querySelector("#vpnmgr_recovery_controls")),text:document.querySelector("#Loading").innerText,exposesCodes:/(verified_stopped|merged|unmanaged|pending|applied)/.test(document.body.innerText)};');
+  assert.equal(started.active,true,'native loading overlay starts');
+  assert.equal(await execute('return window.stopFlag'),0,'native overlay preserves firmware status/autologout polling');
+  assert.equal(started.visible,true,'apply uses the visible full-screen mask');
+  assert.equal(started.untimed,true,'native loading helper is called without a countdown');
+  assert.equal(started.controls,true,'recovery controls live in a native loadingBlock table');
+  assert.match(started.text,/Please wait|Applying settings/);
+  assert.equal(started.exposesCodes,false,'the overlay does not expose backend status codes');
+  await until('!window.vpnmgr_pendingApply && (!document.querySelector("#btnSaveConfig") || !document.querySelector("#btnSaveConfig").disabled)','apply terminal');
+  if(!state.busy && !state.failSlot) {
+    await untilHost(() => state.pageLoads === pageLoadsBefore+1,'confirmed success reloads from saved settings');
+    await until('window.vpnmgr_initComplete && document.querySelector("#btnSaveConfig") && !document.querySelector("#btnSaveConfig").disabled','reloaded settings ready');
+  }
+  else assert.equal(state.pageLoads,pageLoadsBefore,'failed apply retains the current page');
+  await until('document.querySelector("#Loading").style.visibility !== "visible"','native overlay cleanup');
+  assert.equal(await execute('return !/(merged|unmanaged|pending|applied|verified_stopped)/.test(document.querySelector("#Loading").innerText)'),true,'final loading text exposes no backend status codes');
   assert.equal(state.redirects,0);
 }
 
@@ -168,20 +248,42 @@ async function run() {
   state = fixture();
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
   pageUrl = 'http://127.0.0.1:'+server.address().port+'/vpnmgr.asp';
-  // Have ChromeDriver choose its own unused port; parse only its startup announcement.
-  driver = spawn(process.env.CHROMEDRIVER || 'chromedriver',['--port=0'],{stdio:['ignore','pipe','pipe']});
+  // Have the selected driver choose an unused port and parse its startup announcement.
+  const firefox = browserType === 'firefox';
+  const driverCommand = firefox ? (process.env.GECKODRIVER || 'geckodriver') : (process.env.CHROMEDRIVER || 'chromedriver');
+  const driverArgs = ['--port=0'];
+  if (firefox) driverArgs.push('--websocket-port=0','--profile-root',profile);
+  driver = spawn(driverCommand,driverArgs,{stdio:['ignore','pipe','pipe']});
   let output = '';
   driver.stdout.on('data',data => { output += data; });
   driver.stderr.on('data',data => { output += data; });
   driver.on('error',error => { output += error.message; });
-  for (let count=0; count<100 && !/started successfully on port (\d+)/.test(output); count++) await pause(100);
-  const port = /started successfully on port (\d+)/.exec(output);
-  assert.ok(port,'ChromeDriver did not start: '+output);
+  const startupPattern = firefox ? /Listening on (?:\[[^\]]+\]|[^:\s]+):(\d+)/ : /started successfully on port (\d+)/;
+  for (let count=0; count<100 && !startupPattern.test(output); count++) await pause(100);
+  const port = startupPattern.exec(output);
+  assert.ok(port,(firefox ? 'geckodriver':'ChromeDriver')+' did not start: '+output);
   driverUrl = 'http://127.0.0.1:'+port[1];
-  const options = {args:['--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check','--disable-background-networking','--user-data-dir='+profile]};
-  if (process.env.CHROME_BINARY) options.binary = process.env.CHROME_BINARY;
-  const created = await wd('POST','/session',{capabilities:{alwaysMatch:{browserName:'chrome','goog:chromeOptions':options}}});
+  let capabilities;
+  if (firefox) {
+    // geckodriver creates and owns a disposable session profile and removes it when deleted.
+    const options = {args:['-headless'],binary:process.env.FIREFOX_BINARY || '/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox'};
+    capabilities = {browserName:'firefox','moz:firefoxOptions':options,webSocketUrl:true};
+  }
+  else {
+    const options = {args:['--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check','--disable-background-networking','--user-data-dir='+profile]};
+    if (process.env.CHROME_BINARY) options.binary = process.env.CHROME_BINARY;
+    capabilities = {browserName:'chrome','goog:chromeOptions':options,'goog:loggingPrefs':{browser:'ALL'}};
+  }
+  let created;
+  try { created = await wd('POST','/session',{capabilities:{alwaysMatch:capabilities}}); }
+  catch (error) { throw new Error(error.message+'\n'+(firefox ? 'geckodriver' : 'ChromeDriver')+' output:\n'+output); }
   session = created.sessionId;
+  if (firefox) {
+    const socketUrl = created.capabilities && created.capabilities.webSocketUrl;
+    assert.ok(socketUrl,'Firefox session did not return the requested WebDriver BiDi URL');
+    await connectBiDi(socketUrl);
+    await sendBiDi('session.subscribe',{events:['log.entryAdded']});
+  }
 
   for (const version of ['2.5.9','2.6.12','2.7.8','']) {
     state = fixture(version);
@@ -213,7 +315,6 @@ async function run() {
       assert.equal(state.lastPayload.vpnmgr_vpn5_managed,'true');
       assert.equal(state.lastPayload.vpnmgr_vpn5_customsettings,'false');
     }
-    await load();
     assert.equal(await execute('return document.form.vpnmgr_vpn1_protocol.value'),'TCP');
     assert.equal(await execute('return document.form.vpnmgr_vpn3_pwd.value'),'fixture=secret\\value');
     await click('#vpnmgr_vpn1_udp');
@@ -229,7 +330,6 @@ async function run() {
   await click('#vpnmgr_vpn1_prov_pia');
   await save();
   assert.equal(state.lastPayload.vpnmgr_vpn1_provider,'PIA');
-  await load();
   assert.equal(await execute('return document.form.vpnmgr_vpn1_provider.value'),'PIA');
   await click('#vpnmgr_vpn1_prov_nordvpn');
   await click('#vpnmgr_vpn1_sch_true');
@@ -244,12 +344,12 @@ async function run() {
   const applies = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
   await save();
   assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,applies);
-  assert.match(await execute('return document.querySelector("#vpnmgr_apply_summary").textContent'),/not submitted.*busy/);
+  assert.match(await execute('return fixtureAlerts[fixtureAlerts.length-1]'),/Another save is in progress.*not submitted/);
   state.busy = false;
   state.failSlot = 2;
   await save();
-  assert.match(await execute('return document.querySelector("#vpnmgr_apply_summary").textContent'),/failed for VPN Client 2/);
-  assert.match(await execute('return document.querySelector("#vpnmgr_client_status_2").textContent'),/failed/);
+  assert.match(await execute('return fixtureAlerts[fixtureAlerts.length-1]'),/failed for VPN Client 2/);
+  assert.equal(await execute('return document.querySelector("#vpnmgr_apply_summary") === null && document.querySelector("#vpnmgr_client_status_2") === null'),true);
 
   state.hold = true;
   state.failSlot = 0;
@@ -260,14 +360,17 @@ async function run() {
   assert.equal(await execute('return vpnmgr_pendingApply.polling'),false);
   const applyPostsBeforeRecovery = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
   const recoveriesBefore = state.recoveries.length;
+  const pageLoadsBeforeLateResult = state.pageLoads;
   state.hold = false;
   state.wrongStatus = true;
-  await click('#btnContinueApply');
-  await until('document.querySelector("#vpnmgr_apply_summary").textContent.indexOf("stale") !== -1','stale result rejected');
+  await clickVisible('#btnContinueApply');
+  await until('window.vpnmgr_lastApplyDiagnostic.indexOf("stale") !== -1','stale result rejected');
   assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,applyPostsBeforeRecovery,'continue checking must not repost a payload');
   assert.equal(state.recoveries.length,recoveriesBefore+1,'continue checking requests safe same-ID recovery');
   state.wrongStatus = false;
-  await until('!vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','late result');
+  await until('!window.vpnmgr_pendingApply && (!document.querySelector("#btnSaveConfig") || !document.querySelector("#btnSaveConfig").disabled)','late result');
+  await untilHost(() => state.pageLoads === pageLoadsBeforeLateResult+1,'late confirmed success reloads saved settings');
+  await until('window.vpnmgr_initComplete && document.querySelector("#btnSaveConfig") && !document.querySelector("#btnSaveConfig").disabled','late result reload ready');
   assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),false);
 
   state = fixture();
@@ -275,8 +378,10 @@ async function run() {
   await load();
   await save();
   assert.equal(state.records.get('apply_'+state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_(\d+)$/)[1]+'.json').clients[0].connection,'verified_stopped');
-  assert.match(await execute('return document.querySelector("#vpnmgr_client_status_1").textContent'),/verified; restored to stopped/);
-  assert.match(await execute('return document.querySelector("#vpnmgr_apply_summary").textContent'),/restored to stopped/);
+  const stoppedId = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_(\d+)$/)[1];
+  const browserLog = await browserConsoleMessages();
+  assert.equal(browserLog.some(message => message.includes(stoppedId) && message.includes('verified_stopped')),true,'plain-text console diagnostics remain inspectable across the successful reload');
+  assert.equal(await execute('return fixtureAlerts.length'),0,'verified stopped completes without an error alert');
 
   state = fixture();
   state.loseSettingsPost = true;
@@ -288,11 +393,11 @@ async function run() {
   await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
   await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','lost POST timeout');
   const lostApplyCount = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
-  await click('#btnContinueApply');
+  await clickVisible('#btnContinueApply');
   await until('!vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','expired reservation recovery');
   assert.equal(state.recoveries.length,1);
   assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,lostApplyCount,'recovery must not repeat the lost payload');
-  assert.match(await execute('return document.querySelector("#vpnmgr_apply_summary").textContent'),/expired/);
+  assert.match(await execute('return vpnmgr_lastApplyDiagnostic'),/expired/);
   assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),false);
 
   state = fixture();
@@ -306,8 +411,8 @@ async function run() {
   await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
   await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','recovery POST loss timeout');
   const recoveryLossApplyCount = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
-  await click('#btnContinueApply');
-  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.polling && document.querySelector("#vpnmgr_apply_summary").textContent.indexOf("still reserved") !== -1','recovery acknowledgement lost');
+  await clickVisible('#btnContinueApply');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.polling && vpnmgr_lastApplyDiagnostic.indexOf("remains reserved") !== -1','recovery acknowledgement lost');
   assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,recoveryLossApplyCount);
   assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),true,'uncertain recovery keeps config frozen');
   assert.equal(await execute('return document.querySelector("#btnReloadSettings").style.display !== "none"'),true,'reload remains an explicit escape');
@@ -316,15 +421,18 @@ async function run() {
   state.runningApply = true;
   await load();
   await click('#btnSaveConfig');
-  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply" && document.querySelector("#vpnmgr_apply_summary").textContent.indexOf("in progress") !== -1','running apply');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply" && Object.keys(vpnmgr_lastApplyLog[vpnmgr_pendingApply.requestId] || {}).some(function(item){return item.indexOf("\\"state\\":\\"running\\"") !== -1;})','running apply');
   const runningId = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_(\d+)$/)[1];
   await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
   await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','running apply timeout');
-  await click('#btnContinueApply');
+  await clickVisible('#btnContinueApply');
   await untilHost(() => state.recoveries.length === 1,'running apply recovery request');
   assert.equal(state.recoveries[0].state,'running','recovery must leave running work unchanged');
   state.completeRunning = true;
-  await until('!vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','running apply completes');
+  const pageLoadsBeforeRunningFinish = state.pageLoads;
+  await until('!window.vpnmgr_pendingApply && (!document.querySelector("#btnSaveConfig") || !document.querySelector("#btnSaveConfig").disabled)','running apply completes');
+  await untilHost(() => state.pageLoads === pageLoadsBeforeRunningFinish+1,'running apply success reloads saved settings');
+  await until('window.vpnmgr_initComplete && document.querySelector("#btnSaveConfig") && !document.querySelector("#btnSaveConfig").disabled','running apply reload ready');
   assert.equal(state.records.get('apply_'+runningId+'.json').state,'done');
   assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,1);
 
@@ -335,16 +443,13 @@ async function run() {
   assert.equal(await execute('return document.form.vpnmgr_vpn1_cityname.value'),'Melbourne');
   await save();
   assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,'999','unchanged unavailable city keeps its saved ID');
-  await load();
   await execute('document.form.vpnmgr_vpn1_cityname.value="Sydney";');
   await save();
   assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,100,'changed city uses its current catalogue ID');
-  await load();
   await execute('var country=document.form.vpnmgr_vpn1_countryname;country.value="Canada";setCitiesforCountry(country);document.form.vpnmgr_vpn1_cityname.value="Toronto";');
   await save();
   assert.equal(state.lastPayload.vpnmgr_vpn1_countryid,14,'changed country uses current catalogue ID');
   assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,200,'changed country and city use current catalogue ID');
-  await load();
   await click('#vpnmgr_vpn1_prov_pia');
   await save();
   assert.equal(state.lastPayload.vpnmgr_vpn1_provider,'PIA');
@@ -381,13 +486,29 @@ async function run() {
   assert.equal(await execute('return document.querySelectorAll("[id^=table_config_vpn]").length'),5);
   assert.equal(await execute('return document.form.vpnmgr_vpn2_protocol.value'),'TCP');
   assert.equal(state.redirects,0);
-  console.log('Real Chrome WebUI journeys passed: runtime families/unknown, five slots, Save/reload, repeated edits, provider/schedule/location changes, busy/partial/stale/late results, reservation recovery/lost acknowledgements, stopped-client status, unavailable provider, load retry and inert firmware response.');
-  console.log('One isolated browser session; '+((Date.now()-started)/1000).toFixed(2)+'s wall. Firmware endpoints were simulated; no router contacted.');
+  console.log('Real '+(firefox ? 'Firefox Developer':'Chrome')+' WebUI journeys passed: runtime families/unknown, five slots, Save/reload, repeated edits, provider/schedule/location changes, native overlay/recovery controls, busy/partial/stale/late results, reservation recovery/lost acknowledgements, stopped-client status, unavailable provider, load retry and inert firmware response.');
+  console.log('One isolated browser session; '+((Date.now()-started)/1000).toFixed(2)+'s wall. Popup boundary: '+(nativePopupPath || 'native-like fixture'));
+  console.log('Firmware endpoints were simulated; no router contacted.');
 }
 
 run().catch(error => { console.error(error.stack);process.exitCode=1; }).finally(async () => {
+  if (bidiSocket && bidiSocket.readyState !== WebSocket.CLOSED) {
+    try {
+      if (bidiSocket.readyState < WebSocket.CLOSING) bidiSocket.close();
+      await Promise.race([
+        new Promise(resolve => bidiSocket.addEventListener('close',resolve,{once:true})),
+        pause(1000)
+      ]);
+    } catch (_) {}
+  }
   if (session) { try { await wd('DELETE',''); } catch (_) {} }
-  if (driver) driver.kill();
+  if (driver && driver.exitCode === null && driver.signalCode === null) {
+    await new Promise(resolve => {
+      const timeout = setTimeout(resolve,2000);
+      driver.once('exit',() => { clearTimeout(timeout);resolve(); });
+      driver.kill();
+    });
+  }
   server.closeAllConnections();
   await new Promise(resolve => server.close(resolve));
   fs.rmSync(profile,{recursive:true,force:true});
