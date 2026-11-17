@@ -36,7 +36,7 @@ If that doesn't work (script not yet on `$PATH`):
 
 | Provider | Status |
 |----------|--------|
-| **NordVPN** | Untested — the profile changes below await live account and router validation |
+| **NordVPN** | Active — TCP and UDP verified with a live account on GT-AX11000 / Merlin 388.13 / OpenVPN 2.7.8 |
 | **Private Internet Access (PIA)** | API tested — needs verification on a live account |
 | **Surfshark** | API tested — needs verification on a live account |
 | **WeVPN** | Deprecated — WeVPN is no longer operational |
@@ -65,7 +65,7 @@ vpnmgr/
 │   ├── jquery.js               # jQuery v3.5.1
 │   └── detect.js               # LAN detection helper
 ├── providers/                  # Provider sub-scripts
-│   ├── provider_nordvpn.sh     # NordVPN — untested profile rework
+│   ├── provider_nordvpn.sh     # NordVPN — active
 │   ├── provider_pia.sh         # PIA — API tested
 │   ├── provider_surfshark.sh   # Surfshark — API tested
 │   ├── provider_wevpn.sh       # WeVPN — deprecated
@@ -112,7 +112,9 @@ After `vpnmgr develop`, the CLI header and the WebUI version show which commit i
 
 Installed revision metadata also controls asset repair, including builds with the same version number. Main-script provenance is recorded before dependent asset downloads; completion is recorded only after they all succeed. Updates resolve a fresh candidate. Ordinary builds without a branch override retain the historical raw-branch fallback when the API is unavailable, record `unknown` provenance, and can reopen without another lookup. This exceptional fallback does not claim exact-revision coherence. A later update can establish a pinned revision again.
 
-Pinned test builds with a branch override make NordVPN available in the WebUI automatically while retaining its honest `UNTESTED`/`API_TESTED` status. Other inactive providers are not enabled. An explicit `VPNMGR_TEST_PROVIDERS` choice remains an optional developer override. Live account, generated router configuration, negotiated cipher, traffic and reconnect checks remain necessary.
+NordVPN is `ACTIVE` following live-account validation on a GT-AX11000 running Merlin 388.13 with built-in OpenVPN 2.7.8. TCP/80 and UDP/53 connections, AES-256-GCM, tunnel-bound HTTPS traffic, native GUI/CLI reconnects, custom settings enabled and disabled, and stopped-client restoration passed. Native OpenVPN versions below 2.6, exact 2.6, and other router models remain unverified.
+
+Pinned test builds with a branch override can also expose NordVPN while a future provider change is awaiting live validation, without changing its status. Other inactive providers are not enabled. An explicit `VPNMGR_TEST_PROVIDERS` choice remains an optional developer override.
 
 ### Testing a provider locally
 

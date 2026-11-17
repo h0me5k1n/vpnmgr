@@ -33,7 +33,7 @@ empty "## Unreleased" heading; the smoke test rejects one.
 
 ### Repository
 
-- Add offline runtime, preset, profile, backend and source/download fixtures, BusyBox CI execution, WebUI contracts and isolated real-browser journeys. NordVPN remains `UNTESTED` pending the required PR/live validation; a separate explicit development flag permits controlled WebUI testing.
+- Add offline runtime, preset, profile, backend and source/download fixtures, BusyBox CI execution, WebUI contracts and isolated real-browser journeys. NordVPN is `ACTIVE` following live-account end-to-end validation on a GT-AX11000 running Merlin 388.13 with built-in OpenVPN 2.7.8; native OpenVPN versions below 2.6, exact 2.6, and other router models remain unverified. A separate explicit development flag permits controlled WebUI testing.
 - Refresh contributor guidance for pinned revisions, committed test commands and current WebUI behavior; mark the original bootstrap plan as historical.
 
 ## v3.4.1 (2026-10-25)

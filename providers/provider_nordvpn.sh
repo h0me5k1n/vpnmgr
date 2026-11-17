@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN provider module for vpnmgr
-# Status: UNTESTED
+# Status: ACTIVE
 # Display: NordVPN
 # Config: NordVPN
 #

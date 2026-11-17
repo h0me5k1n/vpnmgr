@@ -313,4 +313,4 @@ DATA
 	[ "$VPNMGR_UPDATE_CONNECTION" = unknown ] || fail 'failed stop still reported connected'
 	[ "$STOP_SLEEP_COUNT" = 0 ] || fail 'rejected stop waited'
 )
-printf 'WebUI backend request, merge, and update checks passed.\n'  
+printf 'WebUI backend request, merge, and update checks passed.\n'
