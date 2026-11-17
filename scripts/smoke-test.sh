@@ -719,6 +719,83 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Section 15: Firmware compatibility consumers
+# ---------------------------------------------------------------------------
+section "15. Firmware compatibility consumers (offline)"
+
+if bash "${REPO_ROOT}/scripts/firmware-compat-test.sh"; then
+    pass "Firmware compatibility: routing, retry and custom-options consumers"
+else
+    fail "Firmware compatibility: routing, retry and custom-options consumers"
+fi
+
+# ---------------------------------------------------------------------------
+# Section 16: CLI WebUI URL lookup (offline)
+# ---------------------------------------------------------------------------
+section "16. CLI WebUI URL lookup (offline)"
+
+if bash "${REPO_ROOT}/scripts/webui-url-test.sh"; then
+    pass "Get_WebUI_URL: resolves the active menu-tree entry and formats its URL"
+else
+    fail "Get_WebUI_URL: resolves the active menu-tree entry and formats its URL"
+fi
+
+# Section 17: Uninstall removes per-client schedules (offline)
+#
+# ScheduleVPN adds vpnmgr_VPN<n> cron jobs plus services-start lines that
+# recreate them; Auto_Cron/Auto_Startup don't touch either. CancelScheduleVPN
+# is extracted with its hard-coded paths pointed at temp files.
+# ---------------------------------------------------------------------------
+section "17. Uninstall removes per-client schedules (offline)"
+
+if sed -n '/^Menu_Uninstall(){/,/^}/p' "${REPO_ROOT}/vpnmgr.sh" | grep -q 'CancelScheduleVPN "\$i"'; then
+    pass "Menu_Uninstall: cancels per-client schedules"
+else
+    fail "Menu_Uninstall: does not call CancelScheduleVPN"
+fi
+
+_CSV_DIR="$(mktemp -d)"
+_CSV_EXTRACT="${_CSV_DIR}/extract.sh"
+sed -n '/^CancelScheduleVPN(){/,/^}/p' "${REPO_ROOT}/vpnmgr.sh" \
+    | sed "s~/jffs/scripts/services-start~${_CSV_DIR}/services-start~g" > "$_CSV_EXTRACT"
+# shellcheck source=/dev/null
+. "$_CSV_EXTRACT"
+
+SCRIPT_NAME="vpnmgr"
+SCRIPT_CONF="${_CSV_DIR}/config"
+_CSV_CRU=""
+Print_Output() { :; }
+cru() {
+    case "$1" in
+        l) printf '%s\n' "0 4 * * 1 /jffs/scripts/vpnmgr updatevpn 2 #vpnmgr_VPN2#" ;;
+        d) _CSV_CRU="${_CSV_CRU}$2 " ;;
+    esac
+}
+
+printf 'vpn2_schenabled=true\n' > "$SCRIPT_CONF"
+printf '%s\n' '#!/bin/sh' \
+    'cru a vpnmgr_VPN2 "0 4 * * 1 /jffs/scripts/vpnmgr updatevpn 2" # vpnmgr' \
+    'other-addon startup # other' > "${_CSV_DIR}/services-start"
+CancelScheduleVPN 2
+if [[ "$_CSV_CRU" == "vpnmgr_VPN2 " ]] \
+    && ! grep -q 'vpnmgr_VPN2' "${_CSV_DIR}/services-start" \
+    && grep -q 'other-addon' "${_CSV_DIR}/services-start" \
+    && grep -q 'vpn2_schenabled=false' "$SCRIPT_CONF"; then
+    pass "CancelScheduleVPN: removes the cron job and only its services-start line"
+else
+    fail "CancelScheduleVPN: cron deletes '${_CSV_CRU}', services-start: $(tr '\n' '|' < "${_CSV_DIR}/services-start")"
+fi
+
+rm -f "${_CSV_DIR}/services-start"
+if [[ -z "$(CancelScheduleVPN 2 2>&1)" ]]; then
+    pass "CancelScheduleVPN: no services-start file -> no errors"
+else
+    fail "CancelScheduleVPN: errors when services-start is missing"
+fi
+unset -f cru
+rm -rf "$_CSV_DIR"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 TOTAL=$((PASS + FAIL))

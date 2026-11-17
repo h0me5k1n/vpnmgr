@@ -90,7 +90,7 @@ vpnmgr develop   # reinstalls from develop
 
 Each command is a one-off reinstall from that branch. The installed script still checks `main` for updates, so run `vpnmgr develop` again to pick up later changes on `develop`.
 
-After `vpnmgr develop`, the CLI header and the WebUI version show which commit is installed, e.g. `v3.4.0 (develop@9a18d5f)`. Every file in that install comes from that one commit. Installing from `main` again, with `vpnmgr stable` or a normal update, removes the label.
+After `vpnmgr develop`, the CLI header and the WebUI version show which commit is installed, e.g. `v3.4.1 (develop@9a18d5f)`. Every file in that install comes from that one commit. Installing from `main` again, with `vpnmgr stable` or a normal update, removes the label.
 
 ### Testing a provider locally
 
