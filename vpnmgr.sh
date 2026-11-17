@@ -1962,8 +1962,21 @@ UpdateVPNConfig(){
 	if [ "$PRIOR_CONN_STATE" != "2" ] && nvram get vpn_clientx_eas | grep -q "$VPN_NO" && [ "$(getConnectState "$VPN_NO")" = "2" ]; then
 		Print_Output true "VPN client $VPN_NO was not connected before configuration - stopping it again to restore that state" "$WARN"
 		VPNMGR_UPDATE_CONNECTION=unknown
-		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1 || return 1
-		[ "$(getConnectState "$VPN_NO")" = 0 ] || return 1
+		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1 || {
+			Print_Output true "VPN client $VPN_NO stop request failed while restoring its prior state" "$ERR"
+			return 1
+		}
+		_uv_stop_waited=0
+		_uv_stop_state="$(getConnectState "$VPN_NO")"
+		while [ "$_uv_stop_state" != 0 ] && [ "$_uv_stop_waited" -lt 20 ]; do
+			sleep 2
+			_uv_stop_waited=$((_uv_stop_waited + 2))
+			_uv_stop_state="$(getConnectState "$VPN_NO")"
+		done
+		if [ "$_uv_stop_state" != 0 ]; then
+			Print_Output true "VPN client $VPN_NO did not stop within 20 seconds while restoring its prior state" "$ERR"
+			return 1
+		fi
 		VPNMGR_UPDATE_CONNECTION=verified_stopped
 	fi
 

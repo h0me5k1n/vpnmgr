@@ -275,20 +275,42 @@ DATA
 	AUTO_CONNECT=yes; TEST_CONNECTION_STATE=0; TEST_STOP_COUNT=0; STOP_FAIL=no
 	getConnectState(){ printf '%s' "$TEST_CONNECTION_STATE"; }
 	RestartVPNClient(){ TEST_CONNECTION_STATE=2; }
+	STOP_WAIT_ACTIVE=no; STOP_SLEEP_COUNT=0; STOP_APPLY_AFTER=0
+	sleep(){
+		if [ "$STOP_WAIT_ACTIVE" = yes ]; then
+			STOP_SLEEP_COUNT=$((STOP_SLEEP_COUNT + 1))
+			if [ "$STOP_SLEEP_COUNT" -ge "$STOP_APPLY_AFTER" ]; then TEST_CONNECTION_STATE=0; fi
+		fi
+	}
 	service(){
 		[ "$1" = stop_vpnclient1 ] || return 1
 		TEST_STOP_COUNT=$((TEST_STOP_COUNT + 1))
 		[ "$STOP_FAIL" = no ] || return 1
-		TEST_CONNECTION_STATE=0
+		[ "$STOP_APPLY_AFTER" -gt 0 ] || TEST_CONNECTION_STATE=0
 	}
 	UpdateVPNConfig unattended 1 0 || fail 'stopped client verification failed'
 	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION" = 0:verified_stopped ] || fail 'stopped client falsely reported connected'
-	[ "$TEST_STOP_COUNT" = 1 ] || fail 'prior stopped state not restored'
+	[ "$TEST_STOP_COUNT:$STOP_SLEEP_COUNT" = 1:0 ] || fail 'immediate stop added a wait'
+	# The service accepts an asynchronous stop; state clears after a few poll intervals.
+	TEST_CONNECTION_STATE=0; STOP_APPLY_AFTER=3; STOP_SLEEP_COUNT=0; STOP_WAIT_ACTIVE=yes
+	UpdateVPNConfig unattended 1 0 || fail 'delayed stop was not verified'
+	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION:$STOP_SLEEP_COUNT" = 0:verified_stopped:3 ] || fail 'delayed stop state or wait count'
+	# Completion on the final bounded poll is still accepted.
+	TEST_CONNECTION_STATE=0; STOP_APPLY_AFTER=10; STOP_SLEEP_COUNT=0
+	UpdateVPNConfig unattended 1 0 || fail 'stop at deadline was not verified'
+	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION:$STOP_SLEEP_COUNT" = 0:verified_stopped:10 ] || fail 'deadline stop state or wait count'
 	TEST_STOP_COUNT=0
+	STOP_WAIT_ACTIVE=no; STOP_SLEEP_COUNT=0
 	UpdateVPNConfig unattended 1 2 || fail 'prior connected client update failed'
 	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION:$TEST_STOP_COUNT" = 2:connected:0 ] || fail 'prior connected client was stopped'
+	# An accepted stop that never reaches state 0 fails after exactly 20 seconds.
+	TEST_CONNECTION_STATE=2; STOP_APPLY_AFTER=99; STOP_SLEEP_COUNT=0; STOP_WAIT_ACTIVE=yes
+	if UpdateVPNConfig unattended 1 0; then fail 'stop timeout accepted'; fi
+	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION:$STOP_SLEEP_COUNT" = 2:unknown:10 ] || fail 'stop timeout was not bounded or reported honestly'
 	STOP_FAIL=yes
+	STOP_WAIT_ACTIVE=no; STOP_SLEEP_COUNT=0
 	if UpdateVPNConfig unattended 1 0; then fail 'failed state restoration accepted'; fi
 	[ "$VPNMGR_UPDATE_CONNECTION" = unknown ] || fail 'failed stop still reported connected'
+	[ "$STOP_SLEEP_COUNT" = 0 ] || fail 'rejected stop waited'
 )
 printf 'WebUI backend request, merge, and update checks passed.\n'  
