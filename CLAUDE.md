@@ -142,7 +142,7 @@ vpnmgr/
 ├── vpnmgr_www.css               # Legacy styles; current page uses inline CSS
 ├── www/                         # Bundled web assets
 ├── providers/
-│   ├── provider_nordvpn.sh      # UNTESTED; development visibility is separate
+│   ├── provider_nordvpn.sh      # ACTIVE; native TCP/UDP authentication and traffic verified
 │   ├── provider_pia.sh          # API_TESTED
 │   ├── provider_surfshark.sh    # API_TESTED
 │   ├── provider_wevpn.sh        # DEPRECATED
