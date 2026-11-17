@@ -1027,6 +1027,172 @@ Conf_FromSettings(){
 	fi
 }
 
+# WebUI request state is kept outside persistent configuration and contains no secrets.
+Runtime_Init(){
+	VPNMGR_RUNTIME_DIR="${VPNMGR_RUNTIME_DIR:-/tmp/vpnmgr-runtime}"
+	VPNMGR_PRIVATE_DIR="${VPNMGR_RUNTIME_DIR%/}-private"
+	mkdir -p "$VPNMGR_RUNTIME_DIR" "$VPNMGR_PRIVATE_DIR" || return 1
+	chmod 700 "$VPNMGR_PRIVATE_DIR" || return 1
+	# Retain only recent completed request files, never an active reservation.
+	find "$VPNMGR_RUNTIME_DIR" -maxdepth 1 -type f -name 'detection_*.json' -mtime +1 -exec rm -f {} \; 2>/dev/null
+	find "$VPNMGR_RUNTIME_DIR" -maxdepth 1 -type f -name 'apply_*.json' -mtime +1 2>/dev/null | while IFS= read -r _rt_old; do
+		case "$(cat "$_rt_old" 2>/dev/null)" in *'"state":"done"'*|*'"state":"failed"'*|*'"state":"busy"'*|*'"state":"superseded"'*) rm -f "$_rt_old" ;; esac
+	done
+}
+Runtime_ValidID(){
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "${#1}" -le 32 ]
+}
+Runtime_Write(){
+	# The temporary file is a sibling so readers only observe complete JSON.
+	_rt_file="$1"; shift
+	_rt_tmp="$VPNMGR_RUNTIME_DIR/.${_rt_file}.$$"
+	(umask 022; printf '%s\n' "$1" > "$_rt_tmp") && mv -f "$_rt_tmp" "$VPNMGR_RUNTIME_DIR/$_rt_file" || { rm -f "$_rt_tmp"; return 1; }
+}
+Runtime_Detect(){
+	Runtime_ValidID "$1" && Runtime_Init || return 1
+	_rt_id="$1"
+	Detect_OpenVPN_Runtime
+	Runtime_Write "detection_${_rt_id}.json" "{\"request\":\"$_rt_id\",\"state\":\"done\",\"version\":\"$OVPN_RUNTIME_VERSION\",\"number\":\"$OVPN_RUNTIME_NUMBER\",\"family\":\"$OVPN_RUNTIME_FAMILY\",\"status\":\"$OVPN_RUNTIME_STATUS\"}"
+}
+Runtime_Status(){
+	_rt_clients=""; _rt_n=1
+	while [ "$_rt_n" -le 5 ]; do
+		_rt_s=pending; _rt_c=unknown
+		eval "_rt_s=\${_apply_status_$_rt_n:-pending}; _rt_c=\${_apply_connection_$_rt_n:-unknown}"
+		[ -z "$_rt_clients" ] || _rt_clients="$_rt_clients,"
+		_rt_clients="$_rt_clients{\"slot\":$_rt_n,\"status\":\"$_rt_s\",\"connection\":\"$_rt_c\"}"
+		_rt_n=$((_rt_n + 1))
+	done
+	Runtime_Write "apply_${_apply_id}.json" "{\"request\":\"$_apply_id\",\"state\":\"$_apply_state\",\"merged\":${_apply_merged:-false},\"clients\":[$_rt_clients],\"message\":\"$_apply_message\"}"
+}
+Runtime_Release(){
+	[ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)" = "$_apply_id" ] || return 1
+	rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/ready"
+	rmdir "$VPNMGR_RUNTIME_DIR/apply.lock"
+}
+Runtime_Prepare(){
+	Runtime_ValidID "$1" && Runtime_Init || return 1
+	_apply_id="$1"; _apply_merged=false; _apply_message=busy; _apply_state=busy
+	for _apply_init in 1 2 3 4 5; do eval "_apply_status_$_apply_init=pending; _apply_connection_$_apply_init=unknown"; done
+	# Never overwrite the state of a repeated request, including completed work.
+	[ ! -f "$VPNMGR_RUNTIME_DIR/apply_${_apply_id}.json" ] || return 0
+	if ! mkdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null; then
+		_rt_ready="$VPNMGR_RUNTIME_DIR/apply.lock/ready"
+		_rt_stamp="$(cat "$_rt_ready" 2>/dev/null)"
+		case "$_rt_stamp" in ''|*[!0-9]*) ;; *)
+			_rt_now="$(date +%s)"
+			if [ $((_rt_now - _rt_stamp)) -ge 60 ]; then
+				# Rename claims the expired reservation; a worker first removes ready.
+				if mv "$_rt_ready" "$VPNMGR_RUNTIME_DIR/apply.lock/expired.$$" 2>/dev/null; then
+					_rt_expired_id="$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)"
+					if Runtime_ValidID "$_rt_expired_id"; then
+						_rt_new_id="$_apply_id"; _apply_id="$_rt_expired_id"; _apply_state=superseded; _apply_message=expired; Runtime_Status || { rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/expired.$$"; rmdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null || :; return 1; }
+						_apply_id="$_rt_new_id"; _apply_state=busy; _apply_message=busy
+					fi
+					rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/expired.$$"
+					rmdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null || :
+				fi
+			fi ;;
+		esac
+		mkdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null || { Runtime_Status; return $?; }
+	fi
+	(umask 077; printf '%s\n' "$_apply_id" > "$VPNMGR_RUNTIME_DIR/apply.lock/owner" && date +%s > "$VPNMGR_RUNTIME_DIR/apply.lock/ready") || { Runtime_Release; return 1; }
+	_apply_state=ready; _apply_message=ready
+	Runtime_Status || { Runtime_Release; return 1; }
+}
+Runtime_Merge(){
+	_rm_snapshot="$1"; _rm_id="$2"; _rm_shared="${VPNMGR_SETTINGS_FILE:-/jffs/addons/custom_settings.txt}"
+	_rm_tmp="$VPNMGR_PRIVATE_DIR/merge.$$"; _rm_conf="$VPNMGR_PRIVATE_DIR/config.$$"
+	cp -a "$SCRIPT_CONF" "$SCRIPT_CONF.bak" || return 1
+	cp "$SCRIPT_CONF" "$_rm_conf" || return 1
+	while IFS= read -r _rm_line || [ -n "$_rm_line" ]; do
+		case "$_rm_line" in vpnmgr_vpn[1-5]_*) ;; *) continue ;; esac
+		_rm_key="${_rm_line%% *}"; _rm_value="${_rm_line#* }"; _rm_key="${_rm_key#vpnmgr_}"
+		case "$_rm_key" in
+			vpn[1-5]_usn|vpn[1-5]_pwd)
+				_rm_slot="${_rm_key#vpn}"; _rm_slot="${_rm_slot%%_*}"
+				case "$_rm_key" in *_usn) _rm_field=username ;; *) _rm_field=password ;; esac
+				nvram set "vpn_client${_rm_slot}_${_rm_field}=$_rm_value" || { rm -f "$_rm_conf"; return 1; } ;;
+			*)
+				# Pass the value via a file, not awk -v, which interprets escapes.
+				printf '%s\n' "$_rm_value" > "$_rm_tmp" || { rm -f "$_rm_conf"; return 1; }
+				awk -v key="$_rm_key" 'NR==FNR { value=$0; next } index($0,key "=")==1 { print key "=" value; next } { print }' "$_rm_tmp" "$_rm_conf" > "$_rm_conf.next" && mv "$_rm_conf.next" "$_rm_conf" || { rm -f "$_rm_tmp" "$_rm_conf" "$_rm_conf.next"; return 1; } ;;
+		esac
+	done < "$_rm_snapshot"
+	rm -f "$_rm_tmp"
+	cp "$_rm_conf" "$SCRIPT_CONF" && nvram commit || { rm -f "$_rm_conf"; return 1; }
+	rm -f "$_rm_conf"
+	# Never consume a newer tab's submission.
+	[ "$(awk '$1=="vpnmgr_request_id" {print $2; n++} END {if(n!=1) print "invalid"}' "$_rm_shared" 2>/dev/null)" = "$_rm_id" ] || return 2
+	awk '$1 !~ /^vpnmgr_/ || $1 ~ /^vpnmgr_version/' "$_rm_shared" > "$_rm_tmp" || return 1
+	[ "$(awk '$1=="vpnmgr_request_id" {print $2; n++} END {if(n!=1) print "invalid"}' "$_rm_shared" 2>/dev/null)" = "$_rm_id" ] || { rm -f "$_rm_tmp"; return 2; }
+	cat "$_rm_tmp" > "$_rm_shared" || { rm -f "$_rm_tmp"; return 1; }
+	rm -f "$_rm_tmp"
+	return 0
+}
+Runtime_Apply(){
+(
+	Runtime_ValidID "$1" && Runtime_Init || return 1
+	_apply_id="$1"; _apply_merged=false; _apply_message=unreserved; _apply_state=failed
+	for _apply_init in 1 2 3 4 5; do eval "_apply_status_$_apply_init=pending; _apply_connection_$_apply_init=unknown"; done
+	[ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)" = "$_apply_id" ] || { [ -f "$VPNMGR_RUNTIME_DIR/apply_${_apply_id}.json" ] || Runtime_Status; return 1; }
+	_apply_terminal=false
+	_apply_snapshot="$VPNMGR_PRIVATE_DIR/settings.$_apply_id.$$"
+	trap 'Runtime_Apply_Cleanup' EXIT
+	trap 'exit 1' HUP INT TERM
+	# Atomic claim competes with expiry and duplicate event execution.
+	mv "$VPNMGR_RUNTIME_DIR/apply.lock/ready" "$VPNMGR_RUNTIME_DIR/apply.lock/running.$$" 2>/dev/null || return 0
+	_apply_state=running; _apply_message=running
+	Runtime_Status || { _apply_message=status_failed; return 1; }
+	if ! (umask 077; cp "${VPNMGR_SETTINGS_FILE:-/jffs/addons/custom_settings.txt}" "$_apply_snapshot"); then
+		_apply_state=failed; _apply_message=snapshot_failed
+	elif [ "$(awk '$1=="vpnmgr_request_id" {print $2; n++} END {if(n!=1) print "invalid"}' "$_apply_snapshot")" != "$_apply_id" ]; then
+		_apply_state=superseded; _apply_message=nonce_mismatch
+	else
+		if Runtime_Merge "$_apply_snapshot" "$_apply_id"; then _apply_rc=0; else _apply_rc=$?; fi
+		case "$_apply_rc" in 0) _apply_merged=true ;; 2) _apply_merged=true; _apply_state=superseded; _apply_message=superseded ;; *) _apply_state=failed; _apply_message=merge_failed ;; esac
+	fi
+	rm -f "$_apply_snapshot"
+	if [ "$_apply_merged" = true ] && [ "$_apply_state" = running ]; then
+		for _apply_slot in 1 2 3 4 5; do
+			_apply_managed="$(grep "^vpn${_apply_slot}_managed=" "$SCRIPT_CONF" | cut -f2- -d=)"
+			if [ "$_apply_managed" = true ]; then
+				eval "_apply_status_$_apply_slot=applying"; Runtime_Status || { _apply_message=status_failed; return 1; }
+				_apply_slot_rc=0
+				ManageVPN "$_apply_slot" || _apply_slot_rc=1
+				case "$(grep "^vpn${_apply_slot}_schenabled=" "$SCRIPT_CONF" | cut -f2- -d=)" in
+					true) ScheduleVPN "$_apply_slot" || _apply_slot_rc=1 ;; false) CancelScheduleVPN "$_apply_slot" || _apply_slot_rc=1 ;;
+				esac
+				UpdateVPNConfig unattended "$_apply_slot" || _apply_slot_rc=1
+				if [ "$_apply_slot_rc" = 0 ]; then eval "_apply_status_$_apply_slot=applied"; else eval "_apply_status_$_apply_slot=failed"; fi
+				eval "_apply_connection_$_apply_slot=\${VPNMGR_UPDATE_CONNECTION:-unknown}"
+			else
+				if [ "$_apply_managed" = false ]; then UnmanageVPN "$_apply_slot" || { eval "_apply_status_$_apply_slot=failed"; Runtime_Status || { _apply_message=status_failed; return 1; }; continue; }; fi
+				eval "_apply_status_$_apply_slot=unmanaged; _apply_connection_$_apply_slot=not_requested"
+			fi
+			Runtime_Status || { _apply_message=status_failed; return 1; }
+		done
+		_apply_state="done"; _apply_message=complete
+	fi
+	Runtime_Status || { _apply_message=status_failed; return 1; }
+	_apply_terminal=true
+)
+}
+Runtime_Apply_Cleanup(){
+	[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/running.$$" ] || return 0
+	rm -f "$_apply_snapshot" "$VPNMGR_PRIVATE_DIR/merge.$$" "$VPNMGR_PRIVATE_DIR/config.$$" "$VPNMGR_PRIVATE_DIR/config.$$.next"
+	if [ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)" = "$_apply_id" ]; then
+		if [ "$_apply_terminal" != true ]; then
+			_apply_state=failed
+			[ "$_apply_message" = status_failed ] || _apply_message=interrupted
+			Runtime_Status || :
+		fi
+		rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/running.$$"
+		Runtime_Release || :
+	fi
+}
+
 Create_Dirs(){
 	if [ ! -d "$SCRIPT_DIR" ]; then
 		mkdir -p "$SCRIPT_DIR"
@@ -1073,6 +1239,8 @@ Create_Symlinks(){
 	ln -s "$SCRIPT_DIR/providers_list" "$SCRIPT_WEB_DIR/providers.htm" 2>/dev/null
 
 	cp -f "$SCRIPT_DIR/vpnmgr_www.js" "$SCRIPT_WEB_DIR/vpnmgr_www.js" 2>/dev/null
+
+	Runtime_Init && ln -s "$VPNMGR_RUNTIME_DIR" "$SCRIPT_WEB_DIR/runtime" 2>/dev/null
 
 	ln -s /tmp/detect_vpnmgr.js "$SCRIPT_WEB_DIR/detect_vpnmgr.js" 2>/dev/null
 	ln -s /tmp/vpnmgrserverloads "$SCRIPT_WEB_DIR/vpnmgrserverloads.js" 2>/dev/null
@@ -1274,7 +1442,12 @@ ListVPNClients(){
 	printf "\\n"
 }
 
+Default_VPN_Data_Ciphers(){
+	printf '%s' 'AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC'
+}
+
 UpdateVPNConfig(){
+	VPNMGR_UPDATE_CONNECTION=unknown
 	ISUNATTENDED=""
 	if [ "$1" = "unattended" ]; then
 		ISUNATTENDED="true"
@@ -1304,7 +1477,7 @@ UpdateVPNConfig(){
 	OVPN_HOSTNAME="$("provider_${VPN_PROVIDER_LC}_get_server" \
 		"$VPN_COUNTRYID" "$VPN_COUNTRYNAME" \
 		"$VPN_CITYID" "$VPN_CITYNAME" \
-		"$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")"
+		"$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")" || return 1
 	[ -z "$OVPN_HOSTNAME" ] && Print_Output true "Could not determine server identifier for VPN client $VPN_NO" "$ERR" && return 1
 
 	OVPN_DETAIL="$("provider_${VPN_PROVIDER_LC}_get_ovpn" "$OVPN_HOSTNAME" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT" "$OVPN_RUNTIME_FAMILY")" || {
@@ -1370,7 +1543,7 @@ UpdateVPNConfig(){
 	elif [ "$VPN_PROVIDER_LC" = nordvpn ] && [ "$VPN_HMAC" = 3 ]; then
 		VPN_NCP_CIPHERS=""
 	else
-		VPN_NCP_CIPHERS="AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC"
+		VPN_NCP_CIPHERS="$(Default_VPN_Data_Ciphers)"
 	fi
 	CLIENT_CA="$(getClientCA "$OVPN_DETAIL")"
 	[ -z "$CLIENT_CA" ] && Print_Output true "Error determing VPN server Certificate Authority certificate" "$ERR" && return 1
@@ -1398,7 +1571,7 @@ UpdateVPNConfig(){
 		fi
 	fi
 
-	OVPN_HOSTNAME_SHORT="$("provider_${VPN_PROVIDER_LC}_get_short_name" "$OVPN_HOSTNAME" "$OVPN_ADDR")"
+	OVPN_HOSTNAME_SHORT="$("provider_${VPN_PROVIDER_LC}_get_short_name" "$OVPN_HOSTNAME" "$OVPN_ADDR")" || return 1
 
 	EXISTING_ADDR="$(nvram get vpn_client"$VPN_NO"_addr)"
 	EXISTING_PORT="$(nvram get vpn_client"$VPN_NO"_port)"
@@ -1416,50 +1589,50 @@ UpdateVPNConfig(){
 	fi
 
 	if [ -z "$(nvram get vpn_client"$VPN_NO"_addr)" ]; then
-		nvram set vpn_client"$VPN_NO"_adns=3
-		nvram set vpn_client"$VPN_NO"_enforce=1
+		nvram set vpn_client"$VPN_NO"_adns=3 || return 1
+		nvram set vpn_client"$VPN_NO"_enforce=1 || return 1
 		if Firmware_Build_Before 384.18; then
-			nvram set vpn_client"$VPN_NO"_clientlist="<DummyVPN>172.16.14.1>0.0.0.0>VPN"
+			nvram set vpn_client"$VPN_NO"_clientlist="<DummyVPN>172.16.14.1>0.0.0.0>VPN" || return 1
 		elif Firmware_Build_Before 386.3; then
-			nvram set vpn_client"$VPN_NO"_clientlist="<DummyVPN>172.16.14.1>>VPN"
+			nvram set vpn_client"$VPN_NO"_clientlist="<DummyVPN>172.16.14.1>>VPN" || return 1
 		fi
 		if ! nvram get vpn_clientx_eas | grep -q "$VPN_NO"; then
-			nvram set vpn_clientx_eas="$(nvram get vpn_clientx_eas),$VPN_NO"
+			nvram set vpn_clientx_eas="$(nvram get vpn_clientx_eas),$VPN_NO" || return 1
 		fi
 	fi
 
-	nvram set vpn_client"$VPN_NO"_addr="$OVPN_ADDR"
-	nvram set vpn_client"$VPN_NO"_port="$OVPN_PORT"
+	nvram set vpn_client"$VPN_NO"_addr="$OVPN_ADDR" || return 1
+	nvram set vpn_client"$VPN_NO"_port="$OVPN_PORT" || return 1
 	if [ "$VPN_PROT_SHORT" = "TCP" ]; then
-		nvram set vpn_client"$VPN_NO"_proto="tcp-client"
+		nvram set vpn_client"$VPN_NO"_proto="tcp-client" || return 1
 	elif [ "$VPN_PROT_SHORT" = "UDP" ]; then
-		nvram set vpn_client"$VPN_NO"_proto="udp"
+		nvram set vpn_client"$VPN_NO"_proto="udp" || return 1
 	fi
-	VPN_DESC="$("provider_${VPN_PROVIDER_LC}_get_desc" "$OVPN_HOSTNAME" "$OVPN_HOSTNAME_SHORT" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")"
-	nvram set vpn_client"$VPN_NO"_desc="$VPN_DESC"
+	VPN_DESC="$("provider_${VPN_PROVIDER_LC}_get_desc" "$OVPN_HOSTNAME" "$OVPN_HOSTNAME_SHORT" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")" || return 1
+	nvram set vpn_client"$VPN_NO"_desc="$VPN_DESC" || return 1
 
-	nvram set vpn_client"$VPN_NO"_cipher="$OVPN_CIPHER"
-	nvram set vpn_client"$VPN_NO"_crypt="tls"
-	nvram set vpn_client"$VPN_NO"_digest="$OVPN_AUTHDIGEST"
-	nvram set vpn_client"$VPN_NO"_fw=1
-	nvram set vpn_client"$VPN_NO"_if="tun"
-	nvram set vpn_client"$VPN_NO"_nat=1
-	nvram set vpn_client"$VPN_NO"_ncp_ciphers="$VPN_NCP_CIPHERS"
-	nvram set vpn_client"$VPN_NO"_ncp_enable=1
-	nvram set vpn_client"$VPN_NO"_reneg=0
-	nvram set vpn_client"$VPN_NO"_tlsremote=0
-	nvram set vpn_client"$VPN_NO"_userauth=1
-	nvram set vpn_client"$VPN_NO"_useronly=1
+	nvram set vpn_client"$VPN_NO"_cipher="$OVPN_CIPHER" || return 1
+	nvram set vpn_client"$VPN_NO"_crypt="tls" || return 1
+	nvram set vpn_client"$VPN_NO"_digest="$OVPN_AUTHDIGEST" || return 1
+	nvram set vpn_client"$VPN_NO"_fw=1 || return 1
+	nvram set vpn_client"$VPN_NO"_if="tun" || return 1
+	nvram set vpn_client"$VPN_NO"_nat=1 || return 1
+	nvram set vpn_client"$VPN_NO"_ncp_ciphers="$VPN_NCP_CIPHERS" || return 1
+	nvram set vpn_client"$VPN_NO"_ncp_enable=1 || return 1
+	nvram set vpn_client"$VPN_NO"_reneg=0 || return 1
+	nvram set vpn_client"$VPN_NO"_tlsremote=0 || return 1
+	nvram set vpn_client"$VPN_NO"_userauth=1 || return 1
+	nvram set vpn_client"$VPN_NO"_useronly=1 || return 1
 
-	VPN_COMP="$("provider_${VPN_PROVIDER_LC}_get_comp")"
-	nvram set vpn_client"$VPN_NO"_comp="$VPN_COMP"
+	VPN_COMP="$("provider_${VPN_PROVIDER_LC}_get_comp")" || return 1
+	nvram set vpn_client"$VPN_NO"_comp="$VPN_COMP" || return 1
 
-	nvram set vpn_client"$VPN_NO"_hmac="$VPN_HMAC"
+	nvram set vpn_client"$VPN_NO"_hmac="$VPN_HMAC" || return 1
 
 	if Firmware_Build_Before 384.19; then
-		nvram set vpn_client"$VPN_NO"_connretry="-1"
+		nvram set vpn_client"$VPN_NO"_connretry="-1" || return 1
 	else
-		nvram set vpn_client"$VPN_NO"_connretry=0
+		nvram set vpn_client"$VPN_NO"_connretry=0 || return 1
 	fi
 
 	if [ "$(grep "vpn${VPN_NO}_customsettings" "$SCRIPT_CONF" | cut -f2 -d"=")" = "true" ]; then
@@ -1468,7 +1641,7 @@ UpdateVPNConfig(){
 			return 1
 		}
 	else
-		Strip_Stale_X509Name "$VPN_NO"
+		Strip_Stale_X509Name "$VPN_NO" || return 1
 	fi
 
 	if [ "$ISUNATTENDED" = "true" ]; then
@@ -1488,11 +1661,11 @@ UpdateVPNConfig(){
 					y|Y)
 						printf "Please enter username:  "
 						read -r vpnusn
-						nvram set vpn_client"$VPN_NO"_username="$vpnusn"
+						nvram set vpn_client"$VPN_NO"_username="$vpnusn" || return 1
 						printf "\\n"
 						printf "Please enter password:  "
 						read -r vpnpwd
-						nvram set vpn_client"$VPN_NO"_password="$vpnpwd"
+						nvram set vpn_client"$VPN_NO"_password="$vpnpwd" || return 1
 						printf "\\n"
 						break
 					;;
@@ -1511,7 +1684,7 @@ UpdateVPNConfig(){
 			printf "\\n${BOLD}No username set for VPN client %s${CLEARFORMAT}\\n" "$VPN_NO"
 			printf "Please enter username:  "
 			read -r vpnusn
-			nvram set vpn_client"$VPN_NO"_username="$vpnusn"
+			nvram set vpn_client"$VPN_NO"_username="$vpnusn" || return 1
 			printf "\\n"
 		fi
 
@@ -1519,12 +1692,12 @@ UpdateVPNConfig(){
 			printf "\\n${BOLD}No password set for VPN client %s${CLEARFORMAT}\\n" "$VPN_NO"
 			printf "Please enter password:  "
 			read -r vpnpwd
-			nvram set vpn_client"$VPN_NO"_password="$vpnpwd"
+			nvram set vpn_client"$VPN_NO"_password="$vpnpwd" || return 1
 			printf "\\n"
 		fi
 	fi
 
-	nvram commit
+	nvram commit || return 1
 
 	"provider_${VPN_PROVIDER_LC}_write_certs" "$VPN_NO" "$OVPN_DETAIL" || return 1
 
@@ -1533,11 +1706,12 @@ UpdateVPNConfig(){
 	if nvram get vpn_clientx_eas | grep -q "$VPN_NO"; then
 		VPN_RGW="$(nvram get vpn_client"$VPN_NO"_rgw)"
 
-		RestartVPNClient "$VPN_NO"
+		VPNMGR_UPDATE_CONNECTION=failed
+		RestartVPNClient "$VPN_NO" || return 1
 
 		Print_Output true "Checking that VPN client $VPN_NO establishes a connection ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)"
 		tunnelup="false"
-		for i in 1 2 3; do
+		for _uv_attempt in 1 2 3; do
 			waited=0
 			while [ "$waited" -lt 20 ]; do
 				if [ "$(getConnectState "$VPN_NO")" = "2" ]; then
@@ -1548,9 +1722,10 @@ UpdateVPNConfig(){
 				waited=$((waited + 2))
 			done
 			[ "$tunnelup" = "true" ] && break
-			RestartVPNClient "$VPN_NO"
+			[ "$_uv_attempt" -eq 3 ] || RestartVPNClient "$VPN_NO" || return 1
 		done
 
+		[ "$tunnelup" = true ] && VPNMGR_UPDATE_CONNECTION=connected
 		if [ "$tunnelup" = "true" ] && [ "$VPN_RGW" = "1" ]; then
 			if ! ping -w 10 -I "tun1$VPN_NO" 1.1.1.1 >/dev/null 2>&1; then
 				Print_Output true "VPN client $VPN_NO connected but no traffic reached 1.1.1.1 through the tunnel - check routing/firewall ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$WARN"
@@ -1584,6 +1759,8 @@ UpdateVPNConfig(){
 				Print_Output true "VPN client $VPN_NO is not routing any traffic yet - set 'Redirect Internet traffic through tunnel' to Yes (all) or configure VPN Director in the router WebUI" "$WARN"
 			fi
 		fi
+	else
+		VPNMGR_UPDATE_CONNECTION=not_requested
 	fi
 
 	if [ "$retry" = "true" ]; then
@@ -1593,23 +1770,24 @@ UpdateVPNConfig(){
 
 	if [ "$PRIOR_CONN_STATE" != "2" ] && nvram get vpn_clientx_eas | grep -q "$VPN_NO" && [ "$(getConnectState "$VPN_NO")" = "2" ]; then
 		Print_Output true "VPN client $VPN_NO was not connected before configuration - stopping it again to restore that state" "$WARN"
-		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1
+		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1 || return 1
 	fi
 
+	[ "$VPNMGR_UPDATE_CONNECTION" != failed ] || return 1
 	Print_Output true "VPN client $VPN_NO updated ($OVPN_HOSTNAME_SHORT $VPN_TYPE_SHORT $VPN_PROT_SHORT)" "$PASS"
 }
 
 RestartVPNClient(){
 	Print_Output true "Restarting VPN client $1"
-	service stop_vpnclient"$1" >/dev/null 2>&1
+	service stop_vpnclient"$1" >/dev/null 2>&1 || return 1
 	sleep 5
 	if [ ! -f /opt/bin/xargs ]; then
 		Print_Output true "Installing findutils from Entware"
-		opkg update
-		opkg install findutils
+		opkg update || return 1
+		opkg install findutils || return 1
 	fi
 	ps | grep -v grep | grep -i "openvpn" | grep "client$1" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1
-	service start_vpnclient"$1" >/dev/null 2>&1
+	service start_vpnclient"$1" >/dev/null 2>&1 || return 1
 	sleep 5
 }
 
@@ -1621,7 +1799,7 @@ ManageVPN(){
 	fi
 
 	Print_Output true "Enabling management of VPN client $VPN_NO"
-	sed -i 's/^vpn'"$VPN_NO"'_managed.*$/vpn'"$VPN_NO"'_managed=true/' "$SCRIPT_CONF"
+	sed -i 's/^vpn'"$VPN_NO"'_managed.*$/vpn'"$VPN_NO"'_managed=true/' "$SCRIPT_CONF" || return 1
 	Print_Output true "Management of VPN client $VPN_NO successfully enabled" "$PASS"
 }
 
@@ -1629,8 +1807,8 @@ UnmanageVPN(){
 	VPN_NO="$1"
 	
 	Print_Output true "Removing management of VPN client $VPN_NO"
-	sed -i 's/^vpn'"$VPN_NO"'_managed.*$/vpn'"$VPN_NO"'_managed=false/' "$SCRIPT_CONF"
-	CancelScheduleVPN "$VPN_NO"
+	sed -i 's/^vpn'"$VPN_NO"'_managed.*$/vpn'"$VPN_NO"'_managed=false/' "$SCRIPT_CONF" || return 1
+	CancelScheduleVPN "$VPN_NO" || return 1
 	Print_Output true "Management of VPN client $VPN_NO successfully removed" "$PASS"
 }
 
@@ -1643,21 +1821,21 @@ ScheduleVPN(){
 	Print_Output true "Configuring scheduled update for VPN client $VPN_NO"
 	
 	if cru l | grep -q "${SCRIPT_NAME}_VPN${VPN_NO}"; then
-		cru d "${SCRIPT_NAME}_VPN${VPN_NO}"
+		cru d "${SCRIPT_NAME}_VPN${VPN_NO}" || return 1
 	fi
 	
-	cru a "${SCRIPT_NAME}_VPN${VPN_NO}" "$CRU_MINUTES $CRU_HOURS * * $CRU_DAYNUMBERS /jffs/scripts/$SCRIPT_NAME updatevpn $VPN_NO"
+	cru a "${SCRIPT_NAME}_VPN${VPN_NO}" "$CRU_MINUTES $CRU_HOURS * * $CRU_DAYNUMBERS /jffs/scripts/$SCRIPT_NAME updatevpn $VPN_NO" || return 1
 	
 	if [ -f /jffs/scripts/services-start ]; then
-		sed -i "/${SCRIPT_NAME}_VPN${VPN_NO}/d" /jffs/scripts/services-start
-		echo "cru a ${SCRIPT_NAME}_VPN${VPN_NO} \"$CRU_MINUTES $CRU_HOURS * * $CRU_DAYNUMBERS /jffs/scripts/$SCRIPT_NAME updatevpn $VPN_NO\" # $SCRIPT_NAME" >> /jffs/scripts/services-start
+		sed -i "/${SCRIPT_NAME}_VPN${VPN_NO}/d" /jffs/scripts/services-start || return 1
+		echo "cru a ${SCRIPT_NAME}_VPN${VPN_NO} \"$CRU_MINUTES $CRU_HOURS * * $CRU_DAYNUMBERS /jffs/scripts/$SCRIPT_NAME updatevpn $VPN_NO\" # $SCRIPT_NAME" >> /jffs/scripts/services-start || return 1
 	else
-		echo "#!/bin/sh" > /jffs/scripts/services-start
-		echo "cru a ${SCRIPT_NAME}_VPN${VPN_NO} \"$CRU_MINUTES $CRU_HOURS * * $CRU_DAYNUMBERS /jffs/scripts/$SCRIPT_NAME updatevpn $VPN_NO\" # $SCRIPT_NAME" >> /jffs/scripts/services-start
-		chmod 755 /jffs/scripts/services-start
+		echo "#!/bin/sh" > /jffs/scripts/services-start || return 1
+		echo "cru a ${SCRIPT_NAME}_VPN${VPN_NO} \"$CRU_MINUTES $CRU_HOURS * * $CRU_DAYNUMBERS /jffs/scripts/$SCRIPT_NAME updatevpn $VPN_NO\" # $SCRIPT_NAME" >> /jffs/scripts/services-start || return 1
+		chmod 755 /jffs/scripts/services-start || return 1
 	fi
 	
-	sed -i 's/^vpn'"$VPN_NO"'_schenabled.*$/vpn'"$VPN_NO"'_schenabled=true/' "$SCRIPT_CONF"
+	sed -i 's/^vpn'"$VPN_NO"'_schenabled.*$/vpn'"$VPN_NO"'_schenabled=true/' "$SCRIPT_CONF" || return 1
 	
 	Print_Output true "Scheduled update created for VPN client $VPN_NO" "$PASS"
 }
@@ -1668,13 +1846,13 @@ CancelScheduleVPN(){
 	Print_Output true "Removing scheduled update for VPN client $VPN_NO"
 		
 	if cru l | grep -q "${SCRIPT_NAME}_VPN${VPN_NO}"; then
-		cru d "${SCRIPT_NAME}_VPN${VPN_NO}"
+		cru d "${SCRIPT_NAME}_VPN${VPN_NO}" || return 1
 	fi
 	
-	sed -i 's/^vpn'"$VPN_NO"'_schenabled.*$/vpn'"$VPN_NO"'_schenabled=false/' "$SCRIPT_CONF"
+	sed -i 's/^vpn'"$VPN_NO"'_schenabled.*$/vpn'"$VPN_NO"'_schenabled=false/' "$SCRIPT_CONF" || return 1
 	
 	if [ -f /jffs/scripts/services-start ] && grep -q "${SCRIPT_NAME}_VPN${VPN_NO}" /jffs/scripts/services-start; then
-		sed -i "/${SCRIPT_NAME}_VPN${VPN_NO}/d" /jffs/scripts/services-start
+		sed -i "/${SCRIPT_NAME}_VPN${VPN_NO}/d" /jffs/scripts/services-start || return 1
 	fi
 	
 	Print_Output true "Scheduled update cancelled for VPN client $VPN_NO" "$PASS"
@@ -2389,13 +2567,13 @@ Strip_Stale_X509Name(){
 			_ssx_opts="$(nvram get vpn_client"$1"_custom)"
 		fi
 		printf '%s\n' "$_ssx_opts" | grep -q "$_ssx_pattern" || return 0
-		Write_VPNCustomOptions "$1" "$(printf '%s\n' "$_ssx_opts" | grep -v "$_ssx_pattern")"
+		Write_VPNCustomOptions "$1" "$(printf '%s\n' "$_ssx_opts" | grep -v "$_ssx_pattern")" || return 1
 	else
 		_ssx_file=/jffs/openvpn/vpn_client"$1"_custom3
 		if [ ! -f "$_ssx_file" ] || ! grep -q "$_ssx_pattern" "$_ssx_file"; then
 			return 0
 		fi
-		sed -i "/$_ssx_pattern/d" "$_ssx_file"
+		sed -i "/$_ssx_pattern/d" "$_ssx_file" || return 1
 	fi
 	Print_Output true "Removed verify-x509-name from VPN client $1 custom configuration - it pinned a previous server's certificate name" "$WARN"
 }
@@ -3107,7 +3285,7 @@ case "$1" in
 		NTP_Ready
 		Entware_Ready
 		UpdateVPNConfig unattended "$2"
-		exit 0
+		exit $?
 	;;
 	refreshcacheddata)
 		NTP_Ready
@@ -3120,6 +3298,13 @@ case "$1" in
 		exit 0
 	;;
 	service_event)
+		if [ "$2" = start ]; then
+			case "$3" in
+				"${SCRIPT_NAME}runtime_"*) Runtime_Detect "${3#${SCRIPT_NAME}runtime_}"; exit $? ;;
+				"${SCRIPT_NAME}prepare_"*) Runtime_Prepare "${3#${SCRIPT_NAME}prepare_}"; exit $? ;;
+				"${SCRIPT_NAME}apply_"*) Runtime_Apply "${3#${SCRIPT_NAME}apply_}"; exit $? ;;
+			esac
+		fi
 		if [ "$2" = "start" ] && [ "$3" = "$SCRIPT_NAME" ]; then
 			Conf_FromSettings
 			for i in 1 2 3 4 5; do
