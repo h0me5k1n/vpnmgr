@@ -34,7 +34,7 @@ Every provider file has a `# Status:` header on line 3. The status MUST be set c
 
 `API_TESTED` and `ACTIVE` both require `scripts/api-checks/<name>.sh` defining `api_check_<name>()` — the smoke test fails without it. Do not set `API_TESTED` on the strength of a local run alone: the PR's "Check <name>" job must pass, and it is the scheduled run that keeps the status honest afterwards. If the scheduled check opens an issue for an `API_TESTED` provider and it is not fixed, demote it to `UNTESTED`.
 
-**Warning:** `Create_Symlinks()` in `vpnmgr.sh` only writes a provider into `providers_list`/`providers.htm` when its status is literally `ACTIVE` — a non-`ACTIVE` provider doesn't just show as untested, it disappears from the WebUI provider list entirely. If it's the only provider actually copied to the router by `Install_Providers()` (currently just `nordvpn`), setting it to `UNTESTED` leaves the WebUI with zero providers, and `BuildConfigTable()` creates no provider radio buttons at all — every `document.form.vpnmgr_vpn{N}_provider` access elsewhere in `vpnmgr_www.js` throws on an empty/undefined control. Don't leave a provider at a non-`ACTIVE` status across a merge/install if it's the only one users actually have installed — verify and flip it back to `ACTIVE` before that lands somewhere a real router will pull it from.
+`Install_Providers()` has an explicit bundled-module list. Normal WebUI visibility requires `ACTIVE`. For controlled development tests, `VPNMGR_TEST_PROVIDERS=nordvpn` persists an opt-in exposing only NordVPN at `UNTESTED`/`API_TESTED`; empty removes it. It never changes the provider status. The WebUI preserves unavailable saved providers and requires selecting an available provider or disabling management before Save. Never promote a provider merely to make its controls visible.
 
 ## Provider contract — 18 required functions
 
@@ -50,7 +50,9 @@ provider_<name>_version()
 provider_<name>_get_server()
 
 # OVPN configuration for the given server.
-# Arguments: server_id protocol vpn_type
+# Arguments: server_id protocol vpn_type [profile_family]
+# NordVPN accepts legacy|modern as an optional fourth argument, default legacy.
+# The core passes the same family used for preset generation, from its detector.
 # Prints the complete OVPN content to stdout. NEVER write files directly.
 provider_<name>_get_ovpn()
 
@@ -60,6 +62,7 @@ provider_<name>_get_comp()
 # TLS control channel mode, as the firmware's vpn_clientX_hmac setting:
 # -1 disabled, 0/1 tls-auth key direction, 2 tls-auth bi-directional,
 # 3 tls-crypt, 4 tls-crypt-v2. Anything but -1 needs write_certs to write a static key.
+# Arguments: ovpn_content (required for NordVPN's profile-dependent mode).
 provider_<name>_get_hmac()
 
 # Short human-readable label for the server (input to get_desc)
@@ -112,6 +115,12 @@ provider_<name>_get_server_load()
 # Download and cache server/country data. Called by the core on schedule.
 provider_<name>_refresh_cache()
 ```
+
+NordVPN preflight validates the downloaded profile's CA and exactly one supported static-key
+mode before active writes. Its writer selects `tls-auth` or `tls-crypt` from that profile and
+must propagate file-write failures. Modern profiles without explicit `cipher`/`auth` use the
+core defaults/native control-channel behavior; do not infer a missing key from legacy defaults.
+CRLF normalization occurs before parsing. Keep `remote-cert-tls server` and CA validation.
 
 ## Shell compatibility — mandatory
 

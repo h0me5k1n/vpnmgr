@@ -11,6 +11,24 @@ there). At release it is renamed to the version and date. Never leave an
 empty "## Unreleased" heading; the smoke test rejects one.
 -->
 
+## Unreleased
+
+### Added
+
+- Automatically select NordVPN legacy or modern profiles from the router's built-in OpenVPN version. Report unknown versions explicitly and use the legacy fallback.
+- Separate legacy/modern shared, UDP and TCP custom-settings lists using each client's current provider, transport and logging settings. Choice 7 accepts individual slots, ranges and mixed comma-separated selections.
+- Show backend runtime detection and per-client apply/connection results in the WebUI. Reserve each Save before submitting its payload, retain edits on failures and allow continued checking of an unconfirmed request.
+
+### Fixed
+
+- Preflight NordVPN CA and control-channel key material before updating active client state. Handle legacy `tls-auth` and modern `tls-crypt`, normalize CRLF profiles and preserve existing certificate verification.
+- Refresh scripts, providers and WebUI assets from one selected revision, including same-version builds. Preserve revision metadata across update re-execution and distinguish completed asset refreshes from installed source provenance.
+- Reject incomplete WebUI settings, preserve unavailable configured providers and rebuild a fresh scalar payload for each Save.
+
+### Repository
+
+- Add offline runtime, preset, profile, backend and source/download fixtures, BusyBox CI execution, WebUI contracts and isolated real-browser journeys. NordVPN remains `UNTESTED` pending the required PR/live validation; a separate explicit development flag permits controlled WebUI testing.
+
 ## v3.4.1 (2026-10-25)
 
 ### Fixed

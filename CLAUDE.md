@@ -46,12 +46,14 @@ check does not pass.
 on the PR, otherwise to `UNTESTED`. It returns to `ACTIVE` only once the change is verified
 end-to-end with a live account on a real router.**
 
-**Install convention:** `Install_Providers` in `vpnmgr.sh` lists only `ACTIVE` providers. When
-promoting a provider to `ACTIVE`, add it to that loop in the same PR.
+**Install convention:** `Install_Providers` has an explicit bundled-module list; normal WebUI
+visibility still requires `ACTIVE`. `VPNMGR_TEST_PROVIDERS=nordvpn` persists a narrow development
+opt-in exposing NordVPN at `UNTESTED`/`API_TESTED` without promoting its status. Empty removes it.
+Keep module installation, WebUI visibility and actual support status distinct.
 
 ## API check
 
-`scripts/api-check.sh <provider> [--handshake]` must run as root in a container, because it
+`scripts/api-check.sh <provider> [--handshake] [--profile-family=legacy|modern|both]` must run as root in a container, because it
 installs a logging shim at `/usr/sbin/curl` and writes to `/jffs/openvpn`:
 
 ```sh
@@ -61,6 +63,8 @@ docker run --rm -v "$PWD:/repo:ro" alpine:3.24 sh -c \
 
 - A generic baseline runs for every provider using only the function contract, then
   `api_check_<name>` from `scripts/api-checks/<name>.sh` adds provider-specific assertions.
+- NordVPN defaults to both profile families for UDP and TCP. Its optional fourth `get_ovpn`
+  argument is the backend-selected family; old three-argument consumers keep the legacy default.
 - `--handshake` builds an OpenVPN config from the values `UpdateVPNConfig` would store and the
   files `write_certs` wrote, then expects `AUTH_FAILED` with fake credentials. This sends a
   deliberate failed login to the provider, so it runs weekly and on PRs, not daily.
