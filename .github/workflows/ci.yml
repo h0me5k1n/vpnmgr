@@ -28,8 +28,9 @@ jobs:
 
       - name: Run OpenVPN and WebUI contracts under BusyBox ash
         run: |
-          shellcheck --shell=sh --severity=warning scripts/openvpn-runtime-test.sh scripts/openvpn-presets-test.sh scripts/webui-backend-test.sh scripts/api-profile-test.sh scripts/source-download-test.sh scripts/install-source-test.sh
+          shellcheck --shell=sh --severity=warning scripts/openvpn-runtime-test.sh scripts/openvpn-presets-test.sh scripts/webui-backend-test.sh scripts/api-profile-test.sh scripts/source-download-test.sh scripts/install-source-test.sh scripts/banner-test.sh
           busybox ash -n vpnmgr.sh
+          busybox ash scripts/banner-test.sh --busybox
           busybox ash scripts/openvpn-runtime-test.sh
           busybox ash scripts/openvpn-presets-test.sh
           busybox ash scripts/webui-backend-test.sh

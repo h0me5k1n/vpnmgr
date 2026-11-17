@@ -21,6 +21,7 @@ empty "## Unreleased" heading; the smoke test rejects one.
 
 ### Fixed
 
+- Size the CLI banner to fit the version, router model and development source label, using padding compatible with the router's BusyBox awk and keeping its borders aligned for long branch names.
 - Recover a lost WebUI settings POST by expiring only its unused reservation, preserving edits and late/running request correlation without resubmitting settings. Report clients restored to stopped accurately and retain unavailable location IDs only for unchanged selections.
 - Make normal direct installs verify/refetch their own pinned main script before installing dependencies, with automatic NordVPN visibility in pinned test builds. Preserve ordinary `unknown` branch-fallback reentry and the existing `develop`/`stable` switching paths.
 - Preflight NordVPN CA and control-channel key material before updating active client state. Handle legacy `tls-auth` and modern `tls-crypt`, normalize CRLF profiles and preserve existing certificate verification.

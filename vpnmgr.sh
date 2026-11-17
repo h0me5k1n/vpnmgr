@@ -2800,25 +2800,46 @@ PressEnter(){
 
 ScriptHeader(){
 	clear
-	printf "\\n"
-	printf "${BOLD}#######################################################${CLEARFORMAT}\\n"
-	printf "${BOLD}##                                                   ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##   __   __ _ __   _ __   _ __ ___    __ _  _ __    ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##   \ \ / /| '_ \ | '_ \ | '_   _ \  / _  || '__|   ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##    \ V / | |_) || | | || | | | | || (_| || |      ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##     \_/  | .__/ |_| |_||_| |_| |_| \__, ||_|      ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##          | |                        __/ |         ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##          |_|                       |___/          ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##                                                   ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##                 %s on %-11s             ##${CLEARFORMAT}\\n" "$SCRIPT_VERSION" "$ROUTER_MODEL"
+	_sh_source=""
 	if [ -f "$SCRIPT_SOURCE_FILE" ]; then
-		printf "${BOLD}##                 from %-29s##${CLEARFORMAT}\\n" "$(cat "$SCRIPT_SOURCE_FILE")"
+		_sh_source="from $(cat "$SCRIPT_SOURCE_FILE")"
 	fi
-	printf "${BOLD}##                                                   ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##       https://github.com/h0me5k1n/vpnmgr          ##${CLEARFORMAT}\\n"
-	printf "${BOLD}##                                                   ##${CLEARFORMAT}\\n"
-	printf "${BOLD}#######################################################${CLEARFORMAT}\\n"
-	printf "\\n"
+	printf "\\n${BOLD}"
+	awk -v version="$SCRIPT_VERSION on $ROUTER_MODEL" -v source="$_sh_source" '
+		function repeat(character, count, text) {
+			text = ""
+			while (count-- > 0) text = text character
+			return text
+		}
+		function row(text, padding, left) {
+			padding = width - length(text); left = int(padding / 2)
+			print "##" repeat(" ", left) text repeat(" ", padding - left) "##"
+		}
+		BEGIN {
+			width = 51
+			if (length(version) + 2 > width) width = length(version) + 2
+			if (length(source) + 2 > width) width = length(source) + 2
+		}
+		{ logo[NR] = $0 }
+		END {
+			border = repeat("#", width + 4)
+			print border; row("")
+			left = int((width - 51) / 2)
+			for (i = 1; i <= NR; i++)
+				print "##" repeat(" ", left) logo[i] repeat(" ", width - left - length(logo[i])) "##"
+			row(""); row(version)
+			if (source != "") row(source)
+			row(""); row("https://github.com/h0me5k1n/vpnmgr"); row("")
+			print border
+		}' <<'LOGO'
+   __   __ _ __   _ __   _ __ ___    __ _  _ __
+   \ \ / /| '_ \ | '_ \ | '_   _ \  / _  || '__|
+    \ V / | |_) || | | || | | | | || (_| || |
+     \_/  | .__/ |_| |_||_| |_| |_| \__, ||_|
+          | |                        __/ |
+          |_|                       |___/
+LOGO
+	printf "${CLEARFORMAT}\\n"
 }
 
 MainMenu(){
