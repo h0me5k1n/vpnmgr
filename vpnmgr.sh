@@ -1274,19 +1274,96 @@ UpdateVPNConfig(){
 		"$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")"
 	[ -z "$OVPN_HOSTNAME" ] && Print_Output true "Could not determine server identifier for VPN client $VPN_NO" "$ERR" && return 1
 
-	OVPN_DETAIL="$("provider_${VPN_PROVIDER_LC}_get_ovpn" "$OVPN_HOSTNAME" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")"
+	OVPN_DETAIL="$("provider_${VPN_PROVIDER_LC}_get_ovpn" "$OVPN_HOSTNAME" "$VPN_PROT_SHORT" "$VPN_TYPE_SHORT")" || {
+		Print_Output true "Error retrieving VPN server ovpn file" "$ERR"
+		return 1
+	}
 	[ -z "$OVPN_DETAIL" ] && Print_Output true "Error retrieving VPN server ovpn file" "$ERR" && return 1
+	if [ "$VPN_PROVIDER_LC" = nordvpn ]; then
+		provider_nordvpn_preflight "$OVPN_DETAIL" || {
+			Print_Output true "NordVPN profile has invalid or incomplete CA/TLS key material" "$ERR"
+			return 1
+		}
+	fi
 
 	OVPN_ADDR="$(getIP "$OVPN_DETAIL")"
-	[ -z "$OVPN_ADDR" ] && Print_Output true "Could not determine address for VPN server" "$ERR" && return 1
+	case "$OVPN_ADDR" in
+		''|*[!a-zA-Z0-9.:_-]*) Print_Output true "Could not determine a valid address for VPN server" "$ERR"; return 1 ;;
+	esac
 	OVPN_PORT="$(getPort "$OVPN_DETAIL")"
-	[ -z "$OVPN_PORT" ] && Print_Output true "Error determining port for VPN server" "$ERR" && return 1
-	OVPN_CIPHER="$(getCipher "$OVPN_DETAIL")"
-	[ -z "$OVPN_CIPHER" ] && Print_Output true "Error determining cipher for VPN server" "$ERR" && return 1
-	OVPN_AUTHDIGEST="$(getAuthDigest "$OVPN_DETAIL")"
-	[ -z "$OVPN_AUTHDIGEST" ] && Print_Output true "Error determining auth digest for VPN server" "$ERR" && return 1
+	case "$OVPN_PORT" in
+		''|*[!0-9]*) Print_Output true "Error determining port for VPN server" "$ERR"; return 1 ;;
+	esac
+	[ "$OVPN_PORT" -ge 1 ] && [ "$OVPN_PORT" -le 65535 ] || {
+		Print_Output true "Invalid VPN server port" "$ERR"
+		return 1
+	}
+	if [ "$VPN_PROVIDER_LC" = nordvpn ]; then
+		OVPN_PROFILE_PROTO="$(printf '%s\n' "$OVPN_DETAIL" | awk '$1 == "proto" { print $2; exit }')"
+		case "$VPN_PROT_SHORT:$OVPN_PROFILE_PROTO" in
+			UDP:udp|TCP:tcp-client|TCP:tcp) ;;
+			*) Print_Output true "NordVPN profile protocol does not match the selected transport" "$ERR"; return 1 ;;
+		esac
+	fi
+	OVPN_CIPHER="$(getCipher "$OVPN_DETAIL")" || :
+	OVPN_AUTHDIGEST="$(getAuthDigest "$OVPN_DETAIL")" || :
+	OVPN_PROFILE_CIPHERS="$(printf '%s\n' "$OVPN_DETAIL" | awk '$1 == "data-ciphers" || $1 == "ncp-ciphers" { print $2; exit }')"
+	case "$OVPN_PROFILE_CIPHERS" in
+		*[!a-zA-Z0-9:_-]*) Print_Output true "Invalid VPN profile data-ciphers list" "$ERR"; return 1 ;;
+	esac
+	VPN_HMAC="$("provider_${VPN_PROVIDER_LC}_get_hmac" "$OVPN_DETAIL")" || {
+		Print_Output true "Invalid VPN profile TLS control mode" "$ERR"
+		return 1
+	}
+	case "$VPN_HMAC" in -1|0|1|2|3|4) ;; *) Print_Output true "Invalid VPN profile TLS control mode" "$ERR"; return 1 ;; esac
+	if [ "$VPN_PROVIDER_LC" = nordvpn ] && [ "$VPN_HMAC" = 3 ]; then
+		OVPN_PROFILE_TLS_MIN="$(printf '%s\n' "$OVPN_DETAIL" | awk '$1 == "tls-version-min" { print $2; exit }')"
+		case "$OVPN_PROFILE_TLS_MIN" in
+			''|1.2) ;;
+			*) Print_Output true "NordVPN profile TLS minimum cannot be represented by native OpenVPN defaults" "$ERR"; return 1 ;;
+		esac
+	fi
+	if [ -z "$OVPN_CIPHER" ] || [ -z "$OVPN_AUTHDIGEST" ]; then
+		if [ "$VPN_PROVIDER_LC" != nordvpn ] || [ "$VPN_HMAC" != 3 ]; then
+			Print_Output true "VPN profile is missing cipher or auth digest" "$ERR"
+			return 1
+		fi
+		# Modern NordVPN leaves data-ciphers and auth at the OpenVPN 2.6+ defaults.
+		[ -n "$OVPN_CIPHER" ] || OVPN_CIPHER=default
+		[ -n "$OVPN_AUTHDIGEST" ] || OVPN_AUTHDIGEST=default
+	fi
+	if [ -n "$OVPN_PROFILE_CIPHERS" ]; then
+		VPN_NCP_CIPHERS="$OVPN_PROFILE_CIPHERS"
+	elif [ "$VPN_PROVIDER_LC" = nordvpn ] && [ "$VPN_HMAC" = 3 ]; then
+		VPN_NCP_CIPHERS=""
+	else
+		VPN_NCP_CIPHERS="AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC"
+	fi
 	CLIENT_CA="$(getClientCA "$OVPN_DETAIL")"
 	[ -z "$CLIENT_CA" ] && Print_Output true "Error determing VPN server Certificate Authority certificate" "$ERR" && return 1
+	if [ "$VPN_PROVIDER_LC" = nordvpn ] && [ "$(grep "vpn${VPN_NO}_customsettings" "$SCRIPT_CONF" | cut -f2 -d"=")" != true ]; then
+		# Merlin has no native server-role verification field. Keep the user's
+		# custom block intact; reject a profile it cannot safely represent.
+		if Firmware_Build_Before 386.3; then
+			if [ "$(/bin/uname -m)" = aarch64 ]; then
+				VPN_EXISTING_CUSTOM="$(printf '%s' "$(nvram get vpn_client"$VPN_NO"_cust2)$(nvram get vpn_client"$VPN_NO"_cust21)$(nvram get vpn_client"$VPN_NO"_cust22)" | openssl base64 -d -A)"
+			elif [ "$(uname -o)" = ASUSWRT-Merlin ]; then
+				VPN_EXISTING_CUSTOM="$(printf '%s' "$(nvram get vpn_client"$VPN_NO"_cust2)" | openssl base64 -d -A)"
+			else
+				VPN_EXISTING_CUSTOM="$(nvram get vpn_client"$VPN_NO"_custom)"
+			fi
+		else
+			VPN_EXISTING_CUSTOM="$(cat /jffs/openvpn/vpn_client"$VPN_NO"_custom3 2>/dev/null)"
+		fi
+		printf '%s\n' "$VPN_EXISTING_CUSTOM" | grep -Eq '^[[:space:]]*remote-cert-tls[[:space:]]+server([[:space:]]|$)' || {
+			Print_Output true "VPN client $VPN_NO needs remote-cert-tls server in its user-managed custom options" "$ERR"
+			return 1
+		}
+		if [ "$VPN_HMAC" = 3 ] && printf '%s\n' "$VPN_EXISTING_CUSTOM" | grep -Eq '^[[:space:]]*(tls-auth|tls-crypt|key-direction|cipher|auth)[[:space:]]|^[[:space:]]*tls-version-min[[:space:]]+1\.[01]([[:space:]]|$)'; then
+			Print_Output true "VPN client $VPN_NO has custom TLS/cipher options incompatible with the selected tls-crypt profile" "$ERR"
+			return 1
+		fi
+	fi
 
 	OVPN_HOSTNAME_SHORT="$("provider_${VPN_PROVIDER_LC}_get_short_name" "$OVPN_HOSTNAME" "$OVPN_ADDR")"
 
@@ -1334,7 +1411,7 @@ UpdateVPNConfig(){
 	nvram set vpn_client"$VPN_NO"_fw=1
 	nvram set vpn_client"$VPN_NO"_if="tun"
 	nvram set vpn_client"$VPN_NO"_nat=1
-	nvram set vpn_client"$VPN_NO"_ncp_ciphers="AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC"
+	nvram set vpn_client"$VPN_NO"_ncp_ciphers="$VPN_NCP_CIPHERS"
 	nvram set vpn_client"$VPN_NO"_ncp_enable=1
 	nvram set vpn_client"$VPN_NO"_reneg=0
 	nvram set vpn_client"$VPN_NO"_tlsremote=0
@@ -1344,7 +1421,6 @@ UpdateVPNConfig(){
 	VPN_COMP="$("provider_${VPN_PROVIDER_LC}_get_comp")"
 	nvram set vpn_client"$VPN_NO"_comp="$VPN_COMP"
 
-	VPN_HMAC="$("provider_${VPN_PROVIDER_LC}_get_hmac")"
 	nvram set vpn_client"$VPN_NO"_hmac="$VPN_HMAC"
 
 	if Firmware_Build_Before 384.19; then
