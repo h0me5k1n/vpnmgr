@@ -21,6 +21,7 @@ empty "## Unreleased" heading; the smoke test rejects one.
 
 ### Fixed
 
+- Keep the WebUI runtime readout read-only, with automatic checks on page load and console-only manual diagnostics. Allow the backend a polling interval before the first runtime/apply result read, report missing results and still-ready reservations as informational pending notices, and log the final detection outcome.
 - Use Merlin's standard applying-settings overlay and reload after confirmed success, with clear failures and console diagnostics instead of a permanent Apply status panel. Preserve edits and firmware status polling when completion fails or remains unconfirmed.
 - Restore the managed VPN client list and current custom-setting states before Choice 7's batch-selection prompt.
 - Size the CLI banner to fit the version, router model and development source label, using padding compatible with the router's BusyBox awk and keeping its borders aligned for long branch names.

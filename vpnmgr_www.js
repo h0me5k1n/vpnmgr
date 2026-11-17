@@ -37,13 +37,13 @@ function SafeConsole(method,snapshot){
 
 function LogSafeUiEvent(area,event){
 	var allowed = {
-		runtime:['request_failed','malformed','timed_out'],
+		runtime:['pending','request_failed','malformed','timed_out'],
 		settings:['read_failed','malformed'],
 		validation:['invalid_schedule','provider_unavailable','runtime_required','settings_unavailable'],
 		apply:['started','prepare_post_error','reservation_ready','reservation_busy','reservation_failed','reservation_superseded','status_network_error','status_malformed','status_stale','payload_post_error','payload_post_ack','recovery_started','recovery_post_error','recovery_post_ack','overlay_unavailable','timed_out','terminal_success','terminal_failure']
 	};
 	if(!allowed[area] || allowed[area].indexOf(event) == -1) return;
-	SafeConsole('log',{area:area,event:event});
+	SafeConsole(area == 'runtime' && event == 'pending' ? 'info' : 'log',{area:area,event:event});
 }
 
 function AlertVpnMgr(message,event){
@@ -60,7 +60,7 @@ function ApplyRequestIdValid(requestId){ return typeof requestId == 'string' && 
 function LogApplyNotice(pending,event,state){
 	if(!pending || !ApplyRequestIdValid(pending.requestId)) return;
 	var states = ['ready','busy','running','done','failed','superseded','expired'];
-	var events = ['started','prepare_post_error','reservation_ready','reservation_busy','reservation_failed','reservation_superseded','status_network_error','status_malformed','status_stale','payload_post_error','payload_post_ack','recovery_started','recovery_post_error','recovery_post_ack','overlay_unavailable','timed_out','terminal_success','terminal_failure'];
+	var events = ['started','prepare_post_error','reservation_ready','reservation_busy','reservation_failed','reservation_superseded','status_pending','status_network_error','status_malformed','status_stale','payload_post_error','payload_post_ack','recovery_started','recovery_post_error','recovery_post_ack','overlay_unavailable','timed_out','terminal_success','terminal_failure'];
 	if(events.indexOf(event) == -1 || (state && states.indexOf(state) == -1)) return;
 	var snapshot = {request:pending.requestId,phase:pending.phase,event:event};
 	if(state) snapshot.state = state;
@@ -80,7 +80,7 @@ function WriteApplySnapshot(snapshot){
 	if(!vpnmgr_lastApplyLog[requestId]) vpnmgr_lastApplyLog[requestId] = {};
 	if(vpnmgr_lastApplyLog[requestId][key]) return;
 	vpnmgr_lastApplyLog[requestId][key] = true;
-	SafeConsole(snapshot.event == 'terminal_failure' ? 'error' : 'log',snapshot);
+	SafeConsole(snapshot.event == 'terminal_failure' ? 'error' : snapshot.event == 'status_pending' ? 'info' : 'log',snapshot);
 }
 
 function SetLoadingCopy(main,detail){
@@ -258,7 +258,7 @@ function DetectRuntime(){
 		dataType:'text',
 		cache:false,
 		timeout:15000,
-		error:function(){ LogRuntimeFailureOnce(pending,'request_failed'); BeginRuntimePolling(pending); },
+		error:function(){ LogRuntimeEventOnce(pending,'request_failed'); BeginRuntimePolling(pending); },
 		success:function(){ BeginRuntimePolling(pending); }
 	});
 }
@@ -266,27 +266,29 @@ function DetectRuntime(){
 function BeginRuntimePolling(pending){
 	if(vpnmgr_runtimePending !== pending || pending.polling) return;
 	pending.polling = true;
-	PollRuntimeStatus(pending);
+	setTimeout(function(){PollRuntimeStatus(pending);},2000);
 }
 
-function LogRuntimeFailureOnce(pending,event){
-	if(!pending || pending.lastLoggedError == event) return;
-	pending.lastLoggedError = event;
+function LogRuntimeEventOnce(pending,event){
+	if(!pending) return;
+	if(!pending.loggedEvents) pending.loggedEvents = {};
+	if(pending.loggedEvents[event]) return;
+	pending.loggedEvents[event] = true;
 	LogSafeUiEvent('runtime',event);
 }
 
 function PollRuntimeStatus(pending){
 	if(vpnmgr_runtimePending !== pending || !pending.polling || vpnmgr_lastRequestId != pending.requestId) return;
 	if(new Date().getTime()-pending.startedAt >= 120000){
-		FinishRuntimeFailure(pending,'Runtime check timed out. Retry before saving; router fallback has not been assumed.');
+		FinishRuntimeFailure(pending,'Runtime check timed out. Refresh the page to try again before saving.');
 		return;
 	}
 	$j.ajax({
 		url:'/ext/vpnmgr/runtime/detection_'+pending.requestId+'.json',
 		dataType:'json',cache:false,timeout:10000,
-		error:function(){
+		error:function(xhr){
 			if(vpnmgr_runtimePending !== pending || !pending.polling) return;
-			LogRuntimeFailureOnce(pending,'request_failed');
+			LogRuntimeEventOnce(pending,xhr && xhr.status == 404 ? 'pending' : 'request_failed');
 			setTimeout(function(){PollRuntimeStatus(pending);},2000);
 		},
 		success:function(data){
@@ -296,12 +298,13 @@ function PollRuntimeStatus(pending){
 				return;
 			}
 			if(!IsRuntimeDetection(data,pending.requestId)){
-				FinishRuntimeFailure(pending,'Runtime response was malformed or did not match this check. Retry before saving.');
+				FinishRuntimeFailure(pending,'Could not validate the router OpenVPN version. Refresh the page to try again.');
 				return;
 			}
 			pending.polling = false;
 			vpnmgr_runtimePending = null;
 			vpnmgr_runtime = data;
+			SafeConsole('log',{area:'runtime',request:pending.requestId,event:data.status,version:data.version,family:data.family});
 			if(data.status == 'unknown'){
 				vpnmgr_runtimeState = 'unknown';
 				SetText('#vpnmgr_runtime_status','OpenVPN runtime version is unknown. The router will use its documented legacy fallback.');
@@ -881,7 +884,7 @@ function SaveConfig(){
 		return false;
 	}
 	if(vpnmgr_runtimeState != 'known' && vpnmgr_runtimeState != 'unknown'){
-		AlertVpnMgr('A valid router OpenVPN runtime check is required before saving. Retry the runtime check first.','runtime_required');
+		AlertVpnMgr('Wait for the router OpenVPN runtime check to finish, or refresh the page to try again.','runtime_required');
 		return false;
 	}
 	if(vpnmgr_pendingApply) return false;
@@ -1051,7 +1054,10 @@ function BeginApplyPolling(pending,phase){
 	pending.phase = phase;
 	pending.polling = true;
 	pending.startedAt = new Date().getTime();
-	PollApplyStatus(pending);
+	// The firmware acknowledges the event before the backend publishes its file.
+	setTimeout(function(){
+		if(vpnmgr_pendingApply === pending && pending.polling && pending.phase === phase) PollApplyStatus(pending);
+	},2000);
 }
 
 function ContinueApplyChecking(){
@@ -1106,9 +1112,9 @@ function PollApplyStatus(pending){
 	$j.ajax({
 		url:'/ext/vpnmgr/runtime/apply_'+pending.requestId+'.json',
 		dataType:'json',cache:false,timeout:10000,
-		error:function(){
+		error:function(xhr){
 			if(vpnmgr_pendingApply !== pending || !pending.polling) return;
-			LogApplyNotice(pending,'status_network_error');
+			LogApplyNotice(pending,xhr && xhr.status === 404 ? 'status_pending' : 'status_network_error');
 			setTimeout(function(){PollApplyStatus(pending);},2000);
 		},
 		success:function(data){
@@ -1138,7 +1144,7 @@ function PollApplyStatus(pending){
 				SetApplyDiagnostic('Malformed reservation status; polling continues.');
 			}
 			else if(data.state == 'ready'){
-				LogApplyNotice(pending,'status_malformed','ready');
+				LogApplyNotice(pending,'status_pending','ready');
 				SetApplyDiagnostic('The same request remains reserved; settings were not resubmitted.');
 			}
 			else if(ApplyResponseValid(data)){

@@ -39,11 +39,19 @@ silently replaced. Rebuilding settings must replace previous client tables.
 ## Runtime detection
 
 `DetectRuntime` POSTs `start_vpnmgrruntime_<id>` to `/start_apply.htm` with the
-control form. Then it polls the matching JSON file until a bounded timeout.
+control form. Wait one 2-second polling interval before the first result GET,
+then poll the matching JSON file until the original bounded timeout.
 The result contains `request`, `state`, `version`, `number`, `family`, `status`.
 Only matching, valid `done` results enable Save. An unknown runtime is an explicit
 backend result with empty version/number and the documented legacy fallback.
-Missing or malformed results keep Save disabled and expose retry.
+Missing or malformed results keep Save disabled and explain that refreshing the
+page retries the check. Detection runs automatically on page load; keep the
+runtime row read-only, with no retry button. `DetectRuntime()` remains available
+in the browser console for diagnostics without reloading or discarding edits.
+An early HTTP404 means the asynchronous result is pending, not a failed check;
+report it as an informational notice and log the final detected/unknown result
+using allowlisted fields. A slow backend can still produce a network404; never
+turn the initial delay into a success timer or extend the detection deadline.
 
 Display the backend family read-only. Do not add a family selector, compare
 versions in JavaScript or send a browser-selected family to the backend.
@@ -60,7 +68,11 @@ a different profile or preset family after a router update.
    leave the form available without submitting settings.
 3. POST the captured main-form fields with `start_vpnmgrapply_<id>` and JSON
    `amng_custom`, including the matching `vpnmgr_request_id`.
-4. Poll only `apply_<id>.json`. Check request/state/client schema, including null
+4. Poll only `apply_<id>.json`. Wait one 2-second interval before the first
+   reservation/apply/recovery result read; backend publication is asynchronous.
+   A missing file or a still-ready reservation after submission is pending,
+   logged as an informational notice. Retain deadlines and never resubmit the
+   payload because a result is pending. Check request/state/client schema, including null
    client entries. Keep Merlin's zero-argument `showLoading()` overlay visible
    while completion is pending. Preserve the firmware status-polling flag
    synchronously around that helper while waiting or retaining edits on failure.
@@ -120,6 +132,10 @@ status/message codes, atomic JSON writes and propagation of publication failures
   Optional paths: `CHROME_BINARY`, `CHROMEDRIVER`. No package installation or
   router access. Fixtures cover runtime families/unknown, all five sections,
   repeated Save/reload, protocol/provider/custom/schedule edits and error recovery.
+  Use `WEBUI_BROWSER=firefox` with an existing Firefox Developer Edition and
+  geckodriver for Firefox coverage. `WEBUI_JOURNEY=runtime` or `apply` selects
+  focused timing/recovery checks; the default runs the full fixture matrix.
+  These commands use committed scripts and do not require private live-test files.
 
 Fixtures and CI do not establish live router support. Actual served-file hashes,
 Merlin-generated configuration, real authentication, negotiated cipher, traffic

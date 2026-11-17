@@ -6,6 +6,7 @@ var vm = require('vm');
 
 var jqueryState = {ajax:null,text:{},shown:{},properties:{}};
 var consoleSnapshots = [];
+var consoleLevels = [];
 var loadingState = {showArguments:[],hideCalls:0,visible:false};
 var domNodes = {};
 function fakeNode(tagName,id){
@@ -65,10 +66,10 @@ var context = {
 	document:{form:{elements:formElements},formScriptActions:{elements:[],fields:[{name:'productid',value:'router'},{name:'action_script',value:''}]},documentElement:htmlNode,body:bodyNode,createElement:function(tag){return fakeNode(tag);},getElementById:function(id){return domNodes[id] || null;},getElementsByTagName:function(){return []; }},
 	window:{location:{pathname:'/vpnmgr.asp'},pageXOffset:17,pageYOffset:29,scrollTo:function(x,y){context.lastScroll=[x,y];}},
 	location:{reload:function(){context.reloadCount=(context.reloadCount || 0)+1;}},
-	setTimeout:function(callback){ context.queuedTimer = callback; return 1; },
+	setTimeout:function(callback,delay){ context.queuedTimer = callback; context.queuedDelay = delay; return 1; },
 	clearTimeout:function(){},
 	alert:function(message){ context.lastAlert = message; },
-	console:{log:function(prefix,snapshot){consoleSnapshots.push(JSON.parse(snapshot));},error:function(prefix,snapshot){consoleSnapshots.push(JSON.parse(snapshot));}},
+	console:{log:function(prefix,snapshot){consoleLevels.push('log');consoleSnapshots.push(JSON.parse(snapshot));},info:function(prefix,snapshot){consoleLevels.push('info');consoleSnapshots.push(JSON.parse(snapshot));},error:function(prefix,snapshot){consoleLevels.push('error');consoleSnapshots.push(JSON.parse(snapshot));}},
 	showLoading:function(){loadingState.showArguments.push(arguments.length);loadingState.visible=true;loadingMask.style.display='block';loadingMask.style.visibility='visible';htmlNode.style.overflow='hidden';proceedingMain.textContent='Please wait,';},
 	hideLoading:function(){loadingState.hideCalls++;loadingState.visible=false;loadingMask.style.display='none';loadingMask.style.visibility='hidden';htmlNode.style.overflow='';},
 	show_menu:function(){},
@@ -113,6 +114,9 @@ function testRequestIdsAndRuntimeContract(){
 	assert.strictEqual(runtimePost.data.filter(function(field){return field.name == 'action_script';})[0].value,'start_vpnmgrruntime_'+context.vpnmgr_lastRequestId);
 	assert.strictEqual(runtimePost.data.filter(function(field){return field.name == 'amng_custom';}).length,0,'runtime control post must not merge settings');
 	runtimePost.success('redirect response text must remain inert');
+	assert.strictEqual(detectionRequest,undefined,'runtime status is not read immediately after posting its event');
+	assert.strictEqual(context.queuedDelay,2000,'the first runtime status read waits for the normal poll interval');
+	context.queuedTimer();
 	assert.strictEqual(detectionRequest.url,'/ext/vpnmgr/runtime/detection_'+context.vpnmgr_lastRequestId+'.json');
 	detectionRequest.success({request:context.vpnmgr_lastRequestId,state:'done',version:'2.6.12',number:'261200',family:'modern',status:'detected'});
 	assert.strictEqual(context.vpnmgr_runtimeState,'known');
@@ -120,25 +124,32 @@ function testRequestIdsAndRuntimeContract(){
 
 	context.DetectRuntime();
 	runtimePost.success('');
+	context.queuedTimer();
 	detectionRequest.success({request:context.vpnmgr_lastRequestId,state:'done',version:'',number:'',family:'legacy',status:'unknown'});
 	assert.strictEqual(context.vpnmgr_runtimeState,'unknown');
 	assert.ok(jqueryState.text['#vpnmgr_runtime_status'].indexOf('legacy fallback') != -1);
 
 	context.DetectRuntime();
 	runtimePost.success('');
+	context.queuedTimer();
 	detectionRequest.success({request:context.vpnmgr_lastRequestId,state:'done',version:'',number:'',family:'modern',status:'detected'});
 	assert.strictEqual(context.vpnmgr_runtimeState,'failed');
 	context.DetectRuntime();
 	runtimePost.success('');
+	context.queuedTimer();
 	detectionRequest.success({request:context.vpnmgr_lastRequestId,state:'done',version:'2.6.12',number:'261200',family:'modern',status:'unknown'});
 	assert.strictEqual(context.vpnmgr_runtimeState,'failed','unknown runtime status must explicitly use the legacy family');
 	context.DetectRuntime();
 	runtimePost.error();
 	assert.strictEqual(context.vpnmgr_runtimeState,'loading','a transport error still polls the event status');
 	assert.strictEqual(jqueryState.properties['#btnSaveConfig:disabled'],true);
+	assert.strictEqual(context.queuedDelay,2000,'a lost control acknowledgement also observes the first-poll delay');
+	context.queuedTimer();
+	assert.strictEqual(detectionRequest.url.indexOf('/ext/vpnmgr/runtime/detection_'),0,'polling continues after a lost acknowledgement');
 }
 
 function testRuntime404RetryAndCorrelation(){
+	var logStart = consoleSnapshots.length;
 	var calls = [];
 	var detectionCount = 0;
 	var runtimePost;
@@ -157,13 +168,37 @@ function testRuntime404RetryAndCorrelation(){
 	assert.strictEqual(calls[0].url,'/start_apply.htm','runtime event must be posted before status is read');
 	assert.strictEqual(calls[0].dataType,'text');
 	runtimePost.success('firmware redirect remains inert text');
+	assert.strictEqual(detectionCount,0,'the first result read is deferred');
+	assert.strictEqual(context.queuedDelay,2000);
+	context.queuedTimer();
 	assert.strictEqual(detectionCount,1);
 	assert.strictEqual(context.vpnmgr_runtimeState,'loading','initial asynchronous 404 must be retried');
+	assert.ok(consoleSnapshots.slice(logStart).some(function(entry){return entry.area == 'runtime' && entry.event == 'pending';}),'a not-yet-created result is pending');
+	var pendingIndex = consoleSnapshots.findIndex(function(entry,index){return index >= logStart && entry.area == 'runtime' && entry.event == 'pending';});
+	assert.strictEqual(consoleLevels[pendingIndex],'info','an expected early 404 is a console notice');
+	assert.strictEqual(consoleSnapshots.slice(logStart).some(function(entry){return entry.area == 'runtime' && entry.event == 'request_failed';}),false,'expected early 404 is not reported as a failed check');
 	assert.strictEqual(typeof context.queuedTimer,'function');
 	context.queuedTimer();
 	assert.strictEqual(detectionCount,2);
 	assert.strictEqual(context.vpnmgr_runtimeState,'known','matching delayed status should complete the check');
+	assert.ok(consoleSnapshots.slice(logStart).some(function(entry){return entry.area == 'runtime' && entry.event == 'detected' && entry.version == '2.6.12' && entry.family == 'modern';}),'diagnostics record the final runtime result');
 	assert.strictEqual(calls.filter(function(call){return call.url == '/start_apply.htm';}).length,1,'status retries must not repost the runtime event');
+}
+
+function testRuntimeInitialDelayHonorsOriginalDeadline(){
+	var calls = [];
+	jqueryState.ajax = function(options){calls.push(options);};
+	context.DetectRuntime();
+	var pending = context.vpnmgr_runtimePending;
+	var startedAt = pending.startedAt;
+	calls[0].success('');
+	assert.strictEqual(pending.startedAt,startedAt,'the initial delay does not reset the request deadline');
+	pending.startedAt = new Date().getTime()-120001;
+	context.queuedTimer();
+	assert.strictEqual(calls.length,1,'an expired initial wait cannot issue a status GET or repost the event');
+	assert.strictEqual(context.vpnmgr_runtimeState,'failed');
+	assert.strictEqual(context.vpnmgr_runtimePending,null);
+	assert.strictEqual(jqueryState.properties['#btnSaveConfig:disabled'],true,'a timed-out runtime check still blocks Save');
 }
 
 function testStaleRuntimeResponseIgnored(){
@@ -171,16 +206,35 @@ function testStaleRuntimeResponseIgnored(){
 	jqueryState.ajax = function(options){ calls.push(options); };
 	context.DetectRuntime();
 	var oldPost = calls[0];
-	var oldId = context.vpnmgr_lastRequestId;
 	oldPost.success('');
+	var oldTimer = context.queuedTimer;
+	context.DetectRuntime();
+	var currentPost = calls[1];
+	var currentId = context.vpnmgr_lastRequestId;
+	oldTimer();
+	assert.strictEqual(calls.length,2,'a timer for a replaced runtime request cannot issue a GET');
+	currentPost.success('');
+	var currentTimer = context.queuedTimer;
+	currentTimer();
+	var currentStatus = calls[2];
+	currentStatus.success({request:currentId,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
+	assert.strictEqual(context.vpnmgr_runtimeState,'known');
+
+	calls.length = 0;
+	context.DetectRuntime();
+	var oldId = context.vpnmgr_lastRequestId;
+	oldPost = calls[0];
+	oldPost.success('');
+	context.queuedTimer();
 	var oldStatus = calls[1];
 	context.DetectRuntime();
-	var currentPost = calls[2];
+	currentPost = calls[2];
 	var currentId = context.vpnmgr_lastRequestId;
 	currentPost.success('');
-	var currentStatus = calls[3];
 	oldStatus.success({request:oldId,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
 	assert.strictEqual(context.vpnmgr_runtimeState,'loading','a stale response must not satisfy the newer check');
+	context.queuedTimer();
+	currentStatus = calls[3];
 	currentStatus.success({request:currentId,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
 	assert.strictEqual(context.vpnmgr_runtimeState,'known');
 }
@@ -314,6 +368,7 @@ function testStatusCorrelationAndLateCompletion(){
 		}
 	};
 	context.ContinueApplyChecking();
+	context.queuedTimer();
 	assert.strictEqual(context.vpnmgr_pendingApply,null,'late completion should finish the original request');
 	assert.strictEqual(calls.filter(function(call){return call.url == '/start_apply.htm' && call.data.filter(function(field){return field.name == 'action_script';})[0].value.indexOf('start_vpnmgrapply_') == 0;}).length,0);
 	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('Settings saved') != -1);
@@ -366,6 +421,9 @@ function testPrepareGateAndNoncePost(){
 	context.PollApplyStatus(pending);
 	assert.strictEqual(calls[0].url,'/ext/vpnmgr/runtime/apply_'+requestId+'.json');
 	assert.strictEqual(calls[1].url,'/start_apply.htm','settings POST must follow matching ready status');
+	assert.strictEqual(calls.length,2,'apply result read waits for the asynchronous backend');
+	assert.strictEqual(context.queuedDelay,2000);
+	context.queuedTimer();
 	assert.strictEqual(calls[2].url,'/ext/vpnmgr/runtime/apply_'+requestId+'.json');
 }
 
@@ -408,6 +466,8 @@ function testRecoveryAfterLostSettingsPost(){
 	};
 	context.PostPreparedApply(pending);
 	assert.strictEqual(applyPosts,1,'the lost settings POST is attempted once');
+	assert.strictEqual(statusReads,0,'lost acknowledgement still defers the first status read');
+	context.queuedTimer();
 	assert.strictEqual(statusReads,1,'the ready reservation is recognized after POST loss');
 	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('remains reserved') != -1,'ready state explains uncertainty without a malformed-response message');
 	pending.startedAt = 0;
@@ -417,6 +477,7 @@ function testRecoveryAfterLostSettingsPost(){
 	assert.strictEqual(jqueryState.shown['#btnReloadSettings'],true,'timeout offers reload as an explicit escape');
 	context.ContinueApplyChecking();
 	assert.strictEqual(recoverPosts,1);
+	context.queuedTimer();
 	assert.strictEqual(context.vpnmgr_pendingApply,null,'expired reservation is terminal and releases the form');
 	assert.strictEqual(frozenPassword.disabled,false,'original form state is restored');
 	assert.strictEqual(frozenPassword.value,'keep-this-value','recovery never repopulates old values');
@@ -446,6 +507,7 @@ function testRecoveryLossAndLateApplyAreUncertainSafe(){
 	};
 	context.ContinueApplyChecking();
 	assert.strictEqual(recovers,1);
+	context.queuedTimer();
 	assert.strictEqual(applies,0);
 	assert.strictEqual(context.vpnmgr_pendingApply,lostRecovery.pending,'lost recovery acknowledgement leaves status uncertain');
 	assert.strictEqual(lostRecovery.field.disabled,true,'controls stay frozen while recovery is uncertain');
@@ -476,6 +538,7 @@ function testRecoveryLossAndLateApplyAreUncertainSafe(){
 		};
 		context.ContinueApplyChecking();
 		assert.strictEqual(recoveryState,initialState,'recovery leaves running/done backend state unchanged');
+		context.queuedTimer();
 		if(initialState == 'running'){
 			assert.strictEqual(context.vpnmgr_pendingApply,current.pending,'recovery does not cancel a running application');
 			statusState = 'done';
@@ -657,9 +720,40 @@ function testLoadedSettingsContract(){
 	assert.strictEqual(context.LoadedSettingsValid(rows),false);
 }
 
+function testApplyInitialReadAndPendingNotice(){
+	var pending = {requestId:'1616161616161616161',polling:false};
+	context.vpnmgr_pendingApply = pending;
+	var reads = 0;
+	jqueryState.ajax = function(options){ reads++; options.error({status:404}); };
+	context.BeginApplyPolling(pending,'prepare');
+	assert.strictEqual(reads,0,'reservation file is not read before the first polling interval');
+	assert.strictEqual(context.queuedDelay,2000);
+	var obsolete = context.queuedTimer;
+	pending.phase = 'apply';
+	obsolete();
+	assert.strictEqual(reads,0,'an obsolete phase timer cannot read a later phase early');
+	pending.polling = false;
+	context.BeginApplyPolling(pending,'apply');
+	context.queuedTimer();
+	assert.strictEqual(reads,1);
+	assert.strictEqual(consoleSnapshots[consoleSnapshots.length-1].event,'status_pending');
+	assert.strictEqual(consoleLevels[consoleLevels.length-1],'info','an expected missing file is informational');
+	pending.startedAt = 0;
+	context.queuedTimer();
+	assert.strictEqual(reads,1,'the first-read wait is part of the original polling deadline');
+	assert.strictEqual(pending.timedOut,true);
+	pending.polling = true;pending.startedAt = Date.now();
+	jqueryState.ajax = function(options){ reads++; options.success({request:pending.requestId,state:'ready'}); };
+	context.PollApplyStatus(pending);
+	assert.strictEqual(consoleSnapshots[consoleSnapshots.length-1].event,'status_pending','a still-ready reservation is pending, not malformed');
+	assert.strictEqual(consoleLevels[consoleLevels.length-1],'info');
+	context.vpnmgr_pendingApply = null;
+}
+
 testLoadedSettingsContract();
 testRequestIdsAndRuntimeContract();
 testRuntime404RetryAndCorrelation();
+testRuntimeInitialDelayHonorsOriginalDeadline();
 testStaleRuntimeResponseIgnored();
 testFreshPayloadAndAllSlots();
 testStatusCorrelationAndLateCompletion();
@@ -672,4 +766,5 @@ testMalformedClientKeepsPollingReachable();
 testNativeOverlayCleanup();
 testNativeStatusPollingPreserved();
 testAllowlistedConsoleSnapshotsAndDedupe();
+testApplyInitialReadAndPendingNotice();
 process.stdout.write('Web UI contract checks passed.\n');

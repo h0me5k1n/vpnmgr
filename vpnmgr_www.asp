@@ -106,7 +106,7 @@ function LoadCustomSettings(){
 </tr>
 <tr>
 <th width="20%">Router OpenVPN runtime</th>
-<td><span id="vpnmgr_runtime_status" aria-live="polite">Checking router OpenVPN version…</span> <input type="button" class="button_gen" onclick="DetectRuntime();" value="Retry runtime check" id="btnRuntimeRetry"></td>
+<td><span id="vpnmgr_runtime_status" aria-live="polite">Checking router OpenVPN version…</span></td>
 </tr>
 <tr>
 <th width="20%">Cached data</th>
