@@ -105,6 +105,10 @@ function LoadCustomSettings(){
 </td>
 </tr>
 <tr>
+<th width="20%">Router OpenVPN runtime</th>
+<td><span id="vpnmgr_runtime_status" aria-live="polite">Checking router OpenVPN version…</span></td>
+</tr>
+<tr>
 <th width="20%">Cached data</th>
 <td>
 <input type="button" class="button_gen" onclick="RefreshCachedData();" value="Refresh" id="btnRefreshCachedData">
@@ -127,11 +131,14 @@ function LoadCustomSettings(){
 
 
 </table>
+<table width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable" style="border:0px;" id="table_runtime_status">
+<tr><th width="20%">Settings load</th><td><span id="vpnmgr_config_status" aria-live="polite">Loading settings…</span> <input type="button" class="button_gen" onclick="RetryConfigLoad();" value="Retry settings load" id="btnConfigRetry" style="display:none;"></td></tr>
+</table>
 <div style="line-height:10px;">&nbsp;</div>
 <table width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable" style="border:0px;" id="table_buttons">
 <tr class="apply_gen" valign="top" height="35px">
 <td style="background-color:rgb(77, 89, 93);border:0px;">
-<input name="button" type="button" class="button_gen" onclick="SaveConfig();" value="Save"/>
+<input name="button" id="btnSaveConfig" type="button" class="button_gen" onclick="SaveConfig();" value="Save" disabled="disabled"/>
 </td>
 </tr>
 </table>
@@ -153,6 +160,13 @@ function LoadCustomSettings(){
 <input type="hidden" name="action_script" value="">
 <input type="hidden" name="action_wait" value="">
 </form>
+<div id="vpnmgr_recovery_placeholder" style="margin:10px auto;width:745px;">
+<div id="vpnmgr_recovery_controls" style="display:none;text-align:center;padding:12px;color:#FFFFFF;background-color:#1F2D35;">
+<span id="vpnmgr_recovery_notice" aria-live="polite">Apply status is unconfirmed.</span><br>
+<input type="button" class="button_gen" onclick="ContinueApplyChecking();" value="Continue checking" id="btnContinueApply" style="display:none;">
+<input type="button" class="button_gen" onclick="reload();" value="Reload saved settings" id="btnReloadSettings" style="display:none;">
+</div>
+</div>
 <div id="footer"></div>
 </body>
 </html>

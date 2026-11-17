@@ -13,6 +13,11 @@ on:
     - cron: '17 5 * * 1'
   workflow_dispatch:
     inputs:
+      provider:
+        description: Provider to check (all preserves the scheduled/default coverage)
+        type: choice
+        options: [all, nordvpn, pia, surfshark]
+        default: all
       handshake:
         description: Also attempt an OpenVPN handshake with fake credentials
         type: boolean
@@ -46,14 +51,18 @@ jobs:
 
       - name: Build provider matrix from status headers
         id: matrix
+        env:
+          SELECTED_PROVIDER: ${{ inputs.provider || 'all' }}
         run: |
           matrix=$(for f in providers/provider_*.sh; do
             name=$(basename "$f" .sh); name=${name#provider_}
             status=$(grep -m1 '^# Status:' "$f" | awk '{print $3}')
             case "$status" in TEMPLATE|DEPRECATED) continue ;; esac
             printf '%s %s\n' "$name" "$status"
-          done | jq -R -s -c '[split("\n")[] | select(length > 0) | split(" ")
+          done | jq -R -s -c --arg selected "$SELECTED_PROVIDER" '[split("\n")[] | select(length > 0) | split(" ")
+            | select($selected == "all" or .[0] == $selected)
             | {provider: .[0], status: .[1], secret: ("APICHECK_" + (.[0] | ascii_upcase))}]')
+          echo "$matrix" | jq -e 'length > 0' >/dev/null
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "$matrix" | jq .
 

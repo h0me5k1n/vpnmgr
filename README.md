@@ -36,9 +36,22 @@ If that doesn't work (script not yet on `$PATH`):
 
 | Provider | Status |
 |----------|--------|
-| **NordVPN** | Active — maintained and tested |
-| **Private Internet Access (PIA)** | Untested — rewritten to use PIA JSON API; needs verification on a live account |
+| **NordVPN** | Active — TCP and UDP verified with a live account on GT-AX11000 / Merlin 388.13 / OpenVPN 2.7.8 |
+| **Private Internet Access (PIA)** | API tested — needs verification on a live account |
+| **Surfshark** | API tested — needs verification on a live account |
 | **WeVPN** | Deprecated — WeVPN is no longer operational |
+
+The provider file's `# Status:` header is authoritative. The WebUI normally lists only `ACTIVE` providers; automated checks and local fixtures do not establish live support.
+
+## OpenVPN profiles and custom settings
+
+VPNMgr detects the router's built-in `/usr/sbin/openvpn` version. NordVPN uses legacy download URLs below OpenVPN 2.6 and the modern `_2.6` URLs on 2.6 and later. If detection fails, VPNMgr reports the unknown version and uses the legacy fallback. The WebUI displays this backend result; Save always uses a fresh backend detection.
+
+Custom settings use separate shared, UDP and TCP lists for each family, with the selected client's provider, protocol, mute and debug settings. Legacy NordVPN keeps its MTU settings and UDP `mssfix`; modern profiles use OpenVPN's defaults for those options. `persist-key` is omitted on 2.7 and later. UDP-only options are excluded from TCP. `fast-io` is omitted because VPNMgr cannot establish that the router has no effective traffic shaping.
+
+CLI Choice 7 accepts individual clients, ranges and comma-separated combinations, such as `1,3-5`. Disabling VPNMgr custom settings leaves the existing custom-options block in place. The existing removal of a stale `verify-x509-name` restriction during server changes still applies. There is no custom-options backup, restore or migration feature.
+
+WebUI Save reserves an apply request before submitting settings and shows separate results for all five clients. Saved settings, configuration apply and connection results are reported separately, including clients verified and then restored to stopped. A failed or unconfirmed apply preserves the form. **Continue checking** follows the same request and asks the backend to expire an unused reservation after its deadline, without resubmitting settings or cancelling running work. **Reload saved settings** explicitly reloads the page. Save stays disabled until complete settings and a valid runtime response have loaded. An unchanged saved location missing from the current catalogue retains its ID; choosing another provider, country or city does not reuse that old ID.
 
 ## Repository layout
 
@@ -75,11 +88,16 @@ vpnmgr/
 
 ### Installing from a branch
 
-Replace `<branch>` with the branch name:
+Use the normal download/chmod/install command with the published repository and branch URL. No separate installer or manually supplied SHA/provider variables are required:
 
 ```sh
-/usr/sbin/curl --retry 3 "https://raw.githubusercontent.com/h0me5k1n/vpnmgr/<branch>/vpnmgr.sh" -o "/jffs/scripts/vpnmgr" && chmod 0755 /jffs/scripts/vpnmgr && /jffs/scripts/vpnmgr install
+/usr/sbin/curl -fsL --retry 3 \
+  "https://raw.githubusercontent.com/<owner>/<repository>/<branch>/vpnmgr.sh" \
+  -o /jffs/scripts/vpnmgr && chmod 0755 /jffs/scripts/vpnmgr && \
+  /jffs/scripts/vpnmgr install
 ```
+
+The installer resolves its configured source once, verifies the downloaded main script against that revision, and refetches/re-executes it if the branch moved. Its providers, WebUI and supporting files then use that same revision. Pinned test builds stop if resolution or verification fails, before normal installation writes. A test build with a branch override stays on its configured test branch for installs and updates.
 
 To switch a running installation between the stable release and the `develop` (pre-release) branch:
 
@@ -92,23 +110,32 @@ Each command is a one-off reinstall from that branch. The installed script still
 
 After `vpnmgr develop`, the CLI header and the WebUI version show which commit is installed, e.g. `v3.4.1 (develop@9a18d5f)`. Every file in that install comes from that one commit. Installing from `main` again, with `vpnmgr stable` or a normal update, removes the label.
 
+Installed revision metadata also controls asset repair, including builds with the same version number. Main-script provenance is recorded before dependent asset downloads; completion is recorded only after they all succeed. Updates resolve a fresh candidate. Ordinary builds without a branch override retain the historical raw-branch fallback when the API is unavailable, record `unknown` provenance, and can reopen without another lookup. This exceptional fallback does not claim exact-revision coherence. A later update can establish a pinned revision again.
+
+NordVPN is `ACTIVE` following live-account validation on a GT-AX11000 running Merlin 388.13 with built-in OpenVPN 2.7.8. TCP/80 and UDP/53 connections, AES-256-GCM, tunnel-bound HTTPS traffic, native GUI/CLI reconnects, custom settings enabled and disabled, and stopped-client restoration passed. Native OpenVPN versions below 2.6, exact 2.6, and other router models remain unverified.
+
+Pinned test builds with a branch override can also expose NordVPN while a future provider change is awaiting live validation, without changing its status. Other inactive providers are not enabled. An explicit `VPNMGR_TEST_PROVIDERS` choice remains an optional developer override.
+
 ### Testing a provider locally
 
 Before deploying to a router, verify a provider's API integration works from your local machine (requires `curl` and `jq`):
 
 ```sh
 bash scripts/provider-test.sh nordvpn
+bash scripts/provider-test.sh nordvpn modern
 ```
 
-This exercises the live NordVPN API — country/city lookups, server recommendations, OVPN config download, and cert extraction — without touching any router state. `write_certs` is validated as a dry run: the CA and tls-auth blocks are extracted from the downloaded OVPN and verified, but nothing is written to the filesystem.
+These exercise the live NordVPN API — country/city lookups, server recommendations, OVPN config download, and cert extraction — without touching router state. The first command selects legacy profiles; the second selects modern profiles. Certificate handling is a dry run, including the profile's `tls-auth` or `tls-crypt` block.
 
 Providers marked `DEPRECATED` in their `# Status:` header skip network tests automatically.
 
 ### Automated API checks
 
-Provider APIs change without notice, so a scheduled workflow (`.github/workflows/api-check.yml`) checks them every day. It runs each provider file, unmodified, under busybox ash in an Alpine container — the same shell the router uses — and verifies that every endpoint still responds and still returns the fields the provider reads. Once a week, and on pull requests that touch a provider, it also builds an OpenVPN client config from the provider's output and attempts a login with fake credentials: being rejected at the login step proves the server address, port, protocol, CA certificate and TLS auth key are all correct.
+Provider APIs change without notice, so a scheduled workflow (`.github/workflows/api-check.yml`) checks them every day under BusyBox ash in an Alpine container. NordVPN checks cover both profile families and both transports by default (`--profile-family=legacy|modern|both` can select a family). Weekly and relevant PR checks also attempt a login with fake credentials. Reaching `AUTH_FAILED` checks the path through the control-channel exchange to login rejection; it does not verify a real login, negotiated data cipher, traffic or reconnect.
 
 When a check fails for an `ACTIVE` or `API_TESTED` provider, an issue labelled `api-check` is opened with the output, and closed automatically when the check passes again.
+
+Offline checks include `bash scripts/smoke-test.sh --offline` and `node scripts/webui-contract-test.js`. With an existing compatible Chrome and ChromeDriver, `node scripts/webui-browser-test.js` runs one isolated browser against loopback firmware fixtures. It uses the real ASP, JavaScript and jQuery, with no router access or package installation. Set `CHROME_BINARY` or `CHROMEDRIVER` if needed. Browser fixtures and CI are separate from live router acceptance.
 
 To run it yourself (requires Docker):
 

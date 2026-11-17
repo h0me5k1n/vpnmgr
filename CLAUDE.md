@@ -1,5 +1,8 @@
 # vpnmgr — Claude Code Project Guide
 
+This is repository contributor guidance. The code and committed test commands
+described here can be used without Claude Code or private test helpers.
+
 ## What this is
 
 **vpnmgr** is a VPN client management tool for AsusWRT-Merlin routers. It manages up to five
@@ -19,7 +22,9 @@ repo merges jackyaz's work as the baseline and restructures it into a modular pr
 | 4 — WebUI | ⏸ Deferred | shared-jy dependency removed; full modernisation pending |
 | 5 — Documentation | ✅ Done | README rewritten |
 
-CI: `bash scripts/smoke-test.sh` — runs on every PR to `main` and `develop`.
+CI: `.github/workflows/ci.yml` runs smoke, JavaScript contracts and isolated
+BusyBox fixtures on PRs/pushes to `main` and `develop`, and by manual dispatch
+for feature branches. Its release-version gate applies only to PRs into `main`.
 Local provider test: `bash scripts/provider-test.sh <provider>` — live API without a router.
 API check: `scripts/api-check.sh` — runs daily in CI (`.github/workflows/api-check.yml`) and on
 PRs that touch a provider. Unmodified provider files, busybox ash, live API. See below.
@@ -46,12 +51,16 @@ check does not pass.
 on the PR, otherwise to `UNTESTED`. It returns to `ACTIVE` only once the change is verified
 end-to-end with a live account on a real router.**
 
-**Install convention:** `Install_Providers` in `vpnmgr.sh` lists only `ACTIVE` providers. When
-promoting a provider to `ACTIVE`, add it to that loop in the same PR.
+**Install convention:** `Install_Providers` has an explicit bundled-module list; normal WebUI
+visibility still requires `ACTIVE`. `VPNMGR_TEST_PROVIDERS=nordvpn` persists a narrow development
+opt-in exposing NordVPN at `UNTESTED`/`API_TESTED` without promoting its status. Empty removes it.
+Pinned builds with `SCRIPT_BRANCH_OVERRIDE` set default to that NordVPN opt-in, so the normal
+direct install needs no extra environment variables. Explicit developer choices still win.
+Keep module installation, WebUI visibility and actual support status distinct.
 
 ## API check
 
-`scripts/api-check.sh <provider> [--handshake]` must run as root in a container, because it
+`scripts/api-check.sh <provider> [--handshake] [--profile-family=legacy|modern|both]` must run as root in a container, because it
 installs a logging shim at `/usr/sbin/curl` and writes to `/jffs/openvpn`:
 
 ```sh
@@ -61,6 +70,8 @@ docker run --rm -v "$PWD:/repo:ro" alpine:3.24 sh -c \
 
 - A generic baseline runs for every provider using only the function contract, then
   `api_check_<name>` from `scripts/api-checks/<name>.sh` adds provider-specific assertions.
+- NordVPN defaults to both profile families for UDP and TCP. Its optional fourth `get_ovpn`
+  argument is the backend-selected family; old three-argument consumers keep the legacy default.
 - `--handshake` builds an OpenVPN config from the values `UpdateVPNConfig` would store and the
   files `write_certs` wrote, then expects `AUTH_FAILED` with fake credentials. This sends a
   deliberate failed login to the provider, so it runs weekly and on PRs, not daily.
@@ -128,10 +139,10 @@ vpnmgr/
 ├── vpnmgr.sh                    # Core — CLI, scheduler, VPN client control, self-update
 ├── vpnmgr_www.asp               # WebUI page (AsusWRT-Merlin Addons API)
 ├── vpnmgr_www.js                # WebUI logic
-├── vpnmgr_www.css               # WebUI styles
+├── vpnmgr_www.css               # Legacy styles; current page uses inline CSS
 ├── www/                         # Bundled web assets
 ├── providers/
-│   ├── provider_nordvpn.sh      # ACTIVE
+│   ├── provider_nordvpn.sh      # ACTIVE; native TCP/UDP authentication and traffic verified
 │   ├── provider_pia.sh          # API_TESTED
 │   ├── provider_surfshark.sh    # API_TESTED
 │   ├── provider_wevpn.sh        # DEPRECATED
@@ -146,7 +157,7 @@ vpnmgr/
 ├── .claude/
 │   └── commands/                # Skill files (used by Claude Code)
 ├── .github/workflows/
-│   ├── ci.yml                   # Smoke test + version bump check
+│   ├── ci.yml                   # Smoke, JS/BusyBox contracts + release-version gate
 │   ├── api-check.yml            # Daily API check, weekly handshake
 │   └── release.yml              # Tags + publishes a GitHub release on version change
 ├── CHANGELOG.md                 # Per-release changes; "Unreleased" only while it has entries
@@ -173,7 +184,7 @@ To test an `API_TESTED` or `UNTESTED` provider that isn't yet in the `Install_Pr
 2. Fetch the provider file directly (replace `main` with your branch if testing pre-merge):
    ```sh
    /usr/sbin/curl -fsL --retry 3 \
-     "https://raw.githubusercontent.com/h0me5k1n/asusmerlin-nvpnmgr/main/providers/provider_<name>.sh" \
+     "https://raw.githubusercontent.com/h0me5k1n/vpnmgr/main/providers/provider_<name>.sh" \
      -o "/jffs/addons/vpnmgr.d/providers/provider_<name>.sh"
    chmod 0755 "/jffs/addons/vpnmgr.d/providers/provider_<name>.sh"
    ```

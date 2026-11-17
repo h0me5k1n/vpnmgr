@@ -109,14 +109,21 @@ _nordvpn_get_city(){
 		| jq -r -e "[ .[] | select(.locations[].country.city.id==${_nc_cityid})][0] // empty"
 }
 
-# provider_nordvpn_get_ovpn hostname protocol vpn_type
+# provider_nordvpn_get_ovpn hostname protocol vpn_type [legacy|modern]
 # Downloads OVPN file from NordVPN CDN and prints contents to stdout.
+# The core passes its detected family explicitly. Independent consumers keep
+# the historical legacy route unless they explicitly request modern profiles.
 provider_nordvpn_get_ovpn(){
 	_gov_hostname="$1"
 	_gov_prot="$2"
 	_gov_prot_lc="$(printf '%s' "$_gov_prot" | tr 'A-Z' 'a-z')"
+	case "${4:-legacy}" in
+		legacy) _gov_suffix="" ;;
+		modern) _gov_suffix="_2.6" ;;
+		*) return 1 ;;
+	esac
 	/usr/sbin/curl -fsL --retry 3 \
-		"https://downloads.nordcdn.com/configs/files/ovpn_${_gov_prot_lc}/servers/${_gov_hostname}.${_gov_prot_lc}.ovpn"
+		"https://downloads.nordcdn.com/configs/files/ovpn_${_gov_prot_lc}/servers/${_gov_hostname}.${_gov_prot_lc}${_gov_suffix}.ovpn"
 }
 
 # provider_nordvpn_get_comp
@@ -126,7 +133,57 @@ provider_nordvpn_get_comp(){
 
 # provider_nordvpn_get_hmac
 provider_nordvpn_get_hmac(){
-	printf "1"
+	# The no-argument form is retained for standalone legacy API consumers.
+	[ "$#" -eq 0 ] && { printf '1'; return 0; }
+	case "$1" in
+		*'<tls-crypt>'*) printf '3' ;;
+		*'<tls-auth>'*)
+			_nh_direction="$(printf '%s\n' "$1" | awk '$1 == "key-direction" { sub(/\r$/, "", $2); print $2; exit }')"
+			case "$_nh_direction" in
+				0|1) printf '%s' "$_nh_direction" ;;
+				'') printf '2' ;;
+				*) return 1 ;;
+			esac ;;
+		*) return 1 ;;
+	esac
+}
+
+# Parse exactly one complete inline block; never return partial key material.
+_nordvpn_profile_block(){
+	printf '%s\n' "$1" | awk -v tag="$2" '
+		{ sub(/\r$/, "") }
+		$0 == "<" tag ">" { if (open || seen) bad=1; open=1; seen++ ; next }
+		$0 == "</" tag ">" { if (!open) bad=1; open=0; closed++; next }
+		open { if ($0 !~ /^#/) { body=body $0 "\n"; if ($0 !~ /^[[:space:]]*$/) nonempty=1 } }
+		END { if (!bad && seen==1 && closed==1 && !open && nonempty) printf "%s", body; else exit 1 }
+	'
+}
+
+provider_nordvpn_preflight(){
+	_np_profile="$(printf '%s\n' "$1" | tr -d '\r')"
+	_np_ca="$(_nordvpn_profile_block "$_np_profile" ca)" || return 1
+	case "$_np_ca" in *'BEGIN CERTIFICATE'*'END CERTIFICATE'*) ;; *) return 1 ;; esac
+	printf '%s\n' "$_np_ca" | openssl x509 -noout >/dev/null 2>&1 || return 1
+	case "$_np_profile" in
+		*'<tls-auth>'*'<tls-crypt>'*|*'<tls-crypt>'*'<tls-auth>'*) return 1 ;;
+		*'<tls-crypt>'*) _np_tag=tls-crypt ;;
+		*'<tls-auth>'*) _np_tag=tls-auth ;;
+		*) return 1 ;;
+	esac
+	_np_static="$(_nordvpn_profile_block "$_np_profile" "$_np_tag")" || return 1
+	printf '%s\n' "$_np_static" | awk '
+		NR==1 { if ($0 != "-----BEGIN OpenVPN Static key V1-----") exit 1; next }
+		/^-----END OpenVPN Static key V1-----$/ { if (NR != 18) exit 1; ended=1; next }
+		{ if (ended || length($0) != 32 || $0 !~ /^[[:xdigit:]]+$/) exit 1 }
+		END { if (!ended || NR != 18) exit 1 }
+	' || return 1
+	_np_mode="$(provider_nordvpn_get_hmac "$_np_profile")" || return 1
+	_np_direction_count="$(printf '%s\n' "$_np_profile" | awk '$1 == "key-direction" { n++ } END { print n+0 }')"
+	[ "$_np_direction_count" -le 1 ] || return 1
+	if [ "$_np_tag" = tls-crypt ] && printf '%s\n' "$_np_profile" | grep -Eq '^[[:space:]]*key-direction[[:space:]]'; then
+		return 1
+	fi
+	return 0
 }
 
 # provider_nordvpn_get_short_name hostname addr
@@ -183,22 +240,24 @@ provider_nordvpn_get_desc(){
 }
 
 # provider_nordvpn_write_certs vpn_no ovpn_detail
-# Writes ca + static (tls-auth); removes crl, key, crt.
+# Writes the validated inline CA and tls-auth/tls-crypt static key.
 provider_nordvpn_write_certs(){
 	_wc_no="$1"
 	_wc_ovpn="$2"
 
-	_wc_ca="$(printf '%s' "$_wc_ovpn" | awk '/<ca>/{flag=1;next}/<\/ca>/{flag=0}flag' | sed '/^#/ d')"
+	provider_nordvpn_preflight "$_wc_ovpn" || { Print_Output true "NordVPN: Invalid CA or TLS key material" "$ERR"; return 1; }
+	_wc_ca="$(_nordvpn_profile_block "$_wc_ovpn" ca)"
 	[ -z "$_wc_ca" ] && Print_Output true "NordVPN: Error determining CA certificate" "$ERR" && return 1
 
-	_wc_static="$(printf '%s' "$_wc_ovpn" | awk '/<tls-auth>/{flag=1;next}/<\/tls-auth>/{flag=0}flag' | sed '/^#/ d')"
-	[ -z "$_wc_static" ] && Print_Output true "NordVPN: Error determining static (tls-auth) key" "$ERR" && return 1
+	_wc_tag=tls-auth
+	case "$_wc_ovpn" in *'<tls-crypt>'*) _wc_tag=tls-crypt ;; esac
+	_wc_static="$(_nordvpn_profile_block "$_wc_ovpn" "$_wc_tag")"
 
-	printf '%s\n' "$_wc_ca"     > /jffs/openvpn/vpn_crt_client"${_wc_no}"_ca
-	printf '%s\n' "$_wc_static" > /jffs/openvpn/vpn_crt_client"${_wc_no}"_static
-	rm -f /jffs/openvpn/vpn_crt_client"${_wc_no}"_crl
-	rm -f /jffs/openvpn/vpn_crt_client"${_wc_no}"_key
-	rm -f /jffs/openvpn/vpn_crt_client"${_wc_no}"_crt
+	printf '%s\n' "$_wc_ca"     > /jffs/openvpn/vpn_crt_client"${_wc_no}"_ca || return 1
+	printf '%s\n' "$_wc_static" > /jffs/openvpn/vpn_crt_client"${_wc_no}"_static || return 1
+	rm -f /jffs/openvpn/vpn_crt_client"${_wc_no}"_crl || return 1
+	rm -f /jffs/openvpn/vpn_crt_client"${_wc_no}"_key || return 1
+	rm -f /jffs/openvpn/vpn_crt_client"${_wc_no}"_crt || return 1
 }
 
 # provider_nordvpn_get_country_names

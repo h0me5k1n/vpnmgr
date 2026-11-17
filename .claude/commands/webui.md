@@ -1,286 +1,142 @@
-# Skill: WebUI Development (vpnmgr_www.*)
+# WebUI development
 
-## Purpose
+Read `CLAUDE.md` first. The product uses ES5 JavaScript and jQuery; Node test
+runners may use the host's current JavaScript syntax.
 
-This skill covers the vpnmgr Web UI — an ASP page, JavaScript file, and CSS stylesheet that integrate into the AsusWRT-Merlin router's admin interface via the Addons API. The WebUI allows users to configure VPN clients, select providers/countries/servers, set schedules, and monitor connection status without SSH.
+## Files and serving
 
-Read `CLAUDE.md` first for project-wide context.
+- `vpnmgr_www.asp` contains the page, inline styles, firmware forms and ASP data
+  injection. `Mount_WebUI` copies it to a registered `userN.asp` under `/www/user`.
+- `vpnmgr_www.js` contains the client logic. The saved copy is under
+  `/jffs/addons/vpnmgr.d`; `Create_Symlinks` copies it into the served directory.
+- Bundled jQuery and `detect.js` are loaded from `/ext/vpnmgr/www/`. Keep global
+  `$` available for firmware code; use `var $j = jQuery` for this page.
+- The current page uses inline styles, not the standalone `vpnmgr_www.css` file.
+- Load `/js/httpApi.js` before `/client_function.js`. Preserve the existing
+  firmware includes and `document.form` / `document.formScriptActions` names.
 
-## Architecture
+Keep the existing fixed-width table layout and dark theme. Use `var`, ordinary
+functions and `$j.ajax`; no frameworks, template literals, arrow functions or
+browser `fetch` in product code. Update the saved and served files together.
 
-### File Roles
+## Reads
 
-| File | Role |
-|------|------|
-| `vpnmgr_www.asp` | HTML template with embedded ASP directives. Rendered by the router's `httpd`. Defines the page structure, form fields, and injects initial data via `<% %>` tags. |
-| `vpnmgr_www.js` | Client-side logic. Loads config from `/ext/vpnmgr/config.htm`, populates form fields, handles provider-specific UI toggling, submits changes back to the script. |
-| `vpnmgr_www.css` | Styles. Must match the AsusWRT-Merlin dark theme (dark greys, specific accent colours). |
+| Endpoint | Content |
+| --- | --- |
+| `/ext/vpnmgr/config.htm` | Per-client `key=value` settings |
+| `/ext/vpnmgr/providers.htm` | Available provider `id\|displayname` lines |
+| `/ext/vpnmgr/nordvpn_countrydata.htm` | Cached NordVPN country/city JSON |
+| `/ext/vpnmgr/<provider>_countrydata.htm` | Other providers' cached country text |
+| `/ext/vpnmgr/runtime/detection_<id>.json` | Request-specific backend runtime |
+| `/ext/vpnmgr/runtime/apply_<id>.json` | Reservation/apply status |
+| `/ext/vpnmgr/vpnmgrserverloads.js` | Existing server-load utility data |
 
-### How It Integrates With Merlin
+The WebUI never calls provider APIs directly. Preserve text after the first `=`
+when parsing settings. Require complete client settings before enabling Save.
+Unavailable saved providers and locations must remain visible rather than being
+silently replaced. Rebuilding settings must replace previous client tables.
 
-1. During install, `vpnmgr.sh` calls `am_settings_set` and copies the ASP/JS/CSS to `/jffs/addons/vpnmgr.d/`
-2. The Addons API mounts the page as a tab under the VPN menu in the router WebUI
-3. The page loads at a URL like `http://router.asus.com/user/vpnmgr.asp`
-4. Data exchange between WebUI and script happens via:
-   - **Config read:** JS fetches `/ext/vpnmgr/config.htm` (a plain-text key=value dump)
-   - **Config write:** JS POSTs changes which the script picks up and writes to the settings file
-   - **Live data:** JS fetches `/tmp/vpnmgrserverloads.tmp` for current server load stats
+## Runtime detection
 
-### Data Flow
+`DetectRuntime` POSTs `start_vpnmgrruntime_<id>` to `/start_apply.htm` with the
+control form. Wait one 2-second polling interval before the first result GET,
+then poll the matching JSON file until the original bounded timeout.
+The result contains `request`, `state`, `version`, `number`, `family`, `status`.
+Only matching, valid `done` results enable Save. An unknown runtime is an explicit
+backend result with empty version/number and the documented legacy fallback.
+Missing or malformed results keep Save disabled and explain that refreshing the
+page retries the check. Detection runs automatically on page load; keep the
+runtime row read-only, with no retry button. `DetectRuntime()` remains available
+in the browser console for diagnostics without reloading or discarding edits.
+An early HTTP404 means the asynchronous result is pending, not a failed check;
+report it as an informational notice and log the final detected/unknown result
+using allowlisted fields. A slow backend can still produce a network404; never
+turn the initial delay into a success timer or extend the detection deadline.
 
-```
-┌─────────────┐     GET /ext/vpnmgr/config.htm      ┌──────────────────┐
-│             │ ──────────────────────────────────►  │                  │
-│  Browser    │                                      │  vpnmgr.sh       │
-│  (JS/ASP)   │  ◄──────────────────────────────────  │  (generates      │
-│             │     key=value config text             │   config.htm)    │
-│             │                                      │                  │
-│             │     POST settings changes            │                  │
-│             │ ──────────────────────────────────►  │  (writes to      │
-│             │                                      │   vpnmgr.conf)   │
-└─────────────┘                                      └──────────────────┘
-```
+Display the backend family read-only. Do not add a family selector, compare
+versions in JavaScript or send a browser-selected family to the backend.
+`UpdateVPNConfig` detects again when applying, so stale browser data cannot choose
+a different profile or preset family after a router update.
 
-## ASP Page Conventions
+## Save and result correlation
 
-### Merlin Addons API Page Structure
+1. Validate and capture a fresh scalar settings payload from all five sections,
+   preserving unrelated addon/version keys and credentials. Capture the current
+   protocol/provider/custom flags, disabled fields and schedule selections.
+2. POST `start_vpnmgrprepare_<id>` using only the control form. Do not send
+   `amng_custom` until its matching status says `ready`. A `busy` response must
+   leave the form available without submitting settings.
+3. POST the captured main-form fields with `start_vpnmgrapply_<id>` and JSON
+   `amng_custom`, including the matching `vpnmgr_request_id`.
+4. Poll only `apply_<id>.json`. Wait one 2-second interval before the first
+   reservation/apply/recovery result read; backend publication is asynchronous.
+   A missing file or a still-ready reservation after submission is pending,
+   logged as an informational notice. Retain deadlines and never resubmit the
+   payload because a result is pending. Check request/state/client schema, including null
+   client entries. Keep Merlin's zero-argument `showLoading()` overlay visible
+   while completion is pending. Preserve the firmware status-polling flag
+   synchronously around that helper while waiting or retaining edits on failure.
+   Log detailed results for all five clients to the
+   browser console, distinguishing `merged`, apply status and connection status.
+   Do not add a permanent Apply status panel or expose request IDs on screen.
+   Construct allowlisted diagnostic records; never log payloads, credentials,
+   pending objects or unfiltered responses. Use plain-text console records so
+   users can inspect them after navigation if their browser retains logs.
+   Confirmed success closes the overlay and reloads saved settings;
+   failures also show a concise alert. A terminal `done` can contain failed clients.
+5. Freeze configuration inputs during an outstanding apply, preserving their
+   prior disabled states. Restore them at terminal results; retain edits.
+   A timeout remains unconfirmed. Continue checking the SAME request without
+   resubmitting. Errors and unconfirmed requests must not auto-reload; Reload is
+   an explicit escape for those cases.
 
-The ASP page follows a strict template expected by Merlin's httpd:
+After an apply timeout, Continue checking POSTs `start_vpnmgrrecover_<id>` as a
+control-only request before polling. The backend expires only an unused matching
+reservation older than 60 seconds, competing atomically with Apply through its
+request-specific `ready.<id>` token. Running or finished work is unchanged.
+Publication failure restores a retryable token. Keep the form frozen until an
+authoritative terminal result; Reload is available as an explicit timeout escape.
+`verified_stopped` means a connection was verified and the previous stopped state
+was restored and observed. Do not display it as currently connected or failed.
 
-```html
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
-  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-<meta http-equiv="X-UA-Compatible" content="IE=Edge"/>
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-<meta HTTP-EQUIV="Pragma" CONTENT="no-cache"/>
-<meta HTTP-EQUIV="Expires" CONTENT="-1"/>
-<link rel="shortcut icon" href="images/favicon.png"/>
-<link rel="icon" href="images/favicon.png"/>
-<title>vpnmgr</title>
+Location retention must compare the loaded provider/country/city identity before
+reusing an unavailable city's ID. Current catalogue selections use current IDs;
+an actual selection change must not inherit an unrelated saved ID.
 
-<!-- Merlin standard includes -->
-<link rel="stylesheet" type="text/css" href="index_style.css"/>
-<link rel="stylesheet" type="text/css" href="form_style.css"/>
-<link rel="stylesheet" type="text/css" href="/ext/shared-jy/shared-jy.css"/>
+Use AJAX `dataType:'text'` for control/apply POST responses. Merlin's
+`start_apply.htm` returns executable callback/reload JavaScript; it must remain
+inert. Do not submit Save through the hidden iframe, override global firmware
+callbacks or use a fixed timer to announce success/reload the page.
 
-<!-- vpnmgr custom styles -->
-<link rel="stylesheet" type="text/css" href="/ext/vpnmgr/vpnmgr_www.css"/>
+## Backend privacy and lifecycle
 
-<script language="JavaScript" type="text/javascript" src="/ext/shared-jy/shared-jy.js"></script>
-<script language="JavaScript" type="text/javascript" src="/js/jquery.js"></script>
-<script language="JavaScript" type="text/javascript" src="/ext/vpnmgr/vpnmgr_www.js"></script>
-</head>
+`Runtime_Prepare` serializes cooperating VPNMgr requests before their payload
+POST. `Runtime_Apply` checks the reservation and nonce, snapshots shared settings
+privately, merges, and reports each client's actual outcome. It cleans up owned
+snapshots and locks on ordinary completion/interruption. This is not a global
+transaction against independent/legacy writers of Merlin's shared settings file.
 
-<body onload="initial();">
-<!-- Page content follows Merlin layout conventions -->
-<div id="TopBanner"></div>
-<div id="Loading" class="popup_bg"></div>
+Public JSON is in `/tmp/vpnmgr-runtime`, linked as `/ext/vpnmgr/runtime/`. Private
+snapshots use its separate sibling directory `/tmp/vpnmgr-runtime-private` with
+mode 0700; never put credentials or raw errors into served JSON. Preserve finite
+status/message codes, atomic JSON writes and propagation of publication failures.
 
-<table class="content" align="center" cellpadding="0" cellspacing="0">
-  <tr>
-    <td width="17">&nbsp;</td>
-    <td valign="top" width="202">
-      <div id="mainMenu"></div>
-      <div id="subMenu"></div>
-    </td>
-    <td valign="top">
-      <div id="tabMenu" class="submenuBlock"></div>
-      <!-- Main content area -->
-      <table width="98%" border="0" align="left" cellpadding="0" cellspacing="0">
-        <tr>
-          <td align="left" valign="top">
-            <!-- vpnmgr UI tables go here -->
-          </td>
-        </tr>
-      </table>
-    </td>
-  </tr>
-</table>
-</body>
-</html>
-```
+## Validation
 
-### Important Constraints
+- `node --check vpnmgr_www.js`
+- `node scripts/webui-contract-test.js` for quick request/payload/state contracts.
+- `sh scripts/webui-backend-test.sh` for actual isolated backend functions;
+  CI also runs this under BusyBox ash.
+- `node scripts/webui-browser-test.js` for one existing Chrome/ChromeDriver
+  session against loopback firmware fixtures, the real ASP/JS and bundled jQuery.
+  Optional paths: `CHROME_BINARY`, `CHROMEDRIVER`. No package installation or
+  router access. Fixtures cover runtime families/unknown, all five sections,
+  repeated Save/reload, protocol/provider/custom/schedule edits and error recovery.
+  Use `WEBUI_BROWSER=firefox` with an existing Firefox Developer Edition and
+  geckodriver for Firefox coverage. `WEBUI_JOURNEY=runtime` or `apply` selects
+  focused timing/recovery checks; the default runs the full fixture matrix.
+  These commands use committed scripts and do not require private live-test files.
 
-- **No modern JS frameworks** — vanilla JavaScript with jQuery (already loaded by Merlin)
-- **No ES6+ syntax** — older browsers and the router's httpd may not handle it. Use `var`, not `let`/`const`. Use `function(){}`, not arrow functions.
-- **No fetch API** — use `jQuery.ajax()` or `XMLHttpRequest`
-- **Table-based layout** — Merlin's UI is table-based. Match the existing `.SettingsTable` pattern.
-- **Form name:** `document.form` is the standard Merlin form reference
-
-## JavaScript Patterns
-
-### Configuration Loading
-
-```javascript
-var $j = jQuery.noConflict();
-
-function get_conf_file() {
-    $j.ajax({
-        url: "/ext/vpnmgr/config.htm",
-        dataType: "text",
-        error: function() {
-            setTimeout(get_conf_file, 1000);
-        },
-        success: function(data) {
-            var settings = data.split("\n");
-            settings = settings.filter(Boolean);
-            // Parse key=value pairs
-            window.vpnmgr_settings = [];
-            for (var i = 0; i < settings.length; i++) {
-                if (settings[i].indexOf("#") === -1) {
-                    var setting = settings[i].split("=");
-                    window.vpnmgr_settings.push(setting);
-                }
-            }
-            // Populate UI from settings
-            PopulateUI();
-        }
-    });
-}
-```
-
-### Provider-Specific UI Toggling
-
-With the modular provider architecture, the WebUI needs to show/hide fields based on selected provider:
-
-```javascript
-function ProviderChanged(vpnNo, provider) {
-    // Hide all provider-specific option groups
-    $j(".provider-options-" + vpnNo).hide();
-
-    // Show the selected provider's options
-    $j("#provider-" + provider + "-options-" + vpnNo).show();
-
-    // Refresh country/city dropdowns for this provider
-    RefreshCountryList(vpnNo, provider);
-}
-```
-
-### Dynamic Country/City Lists
-
-For the modular provider system, country/city lists come from provider sub-scripts and are served via cached data files:
-
-```javascript
-function RefreshCountryList(vpnNo, provider) {
-    $j.ajax({
-        url: "/ext/vpnmgr/countries_" + provider + ".htm",
-        dataType: "text",
-        success: function(data) {
-            var select = $j("[name=vpnmgr_vpn" + vpnNo + "_countryname]");
-            select.empty();
-            var lines = data.split("\n").filter(Boolean);
-            for (var i = 0; i < lines.length; i++) {
-                var parts = lines[i].split("|");
-                select.append(
-                    $j("<option></option>").val(parts[0]).text(parts[1])
-                );
-            }
-        }
-    });
-}
-```
-
-### Settings Save
-
-```javascript
-function SaveSettings() {
-    // Build the settings string from form values
-    var settings = "";
-    for (var vpnno = 1; vpnno <= 5; vpnno++) {
-        settings += BuildVPNSettings(vpnno);
-    }
-
-    // POST back to the script
-    $j.ajax({
-        url: "/ext/vpnmgr/save.htm",
-        type: "POST",
-        data: settings,
-        success: function() {
-            // Show success notification
-            ShowNotification("Settings saved successfully");
-        },
-        error: function() {
-            ShowNotification("Error saving settings", "error");
-        }
-    });
-}
-```
-
-## CSS Conventions
-
-### Merlin Theme Matching
-
-The router UI uses a dark theme. Key colours:
-
-```css
-/* Background layers */
-.SettingsTable {
-    background-color: #1F2D35;
-}
-
-.SettingsTable td.settingname {
-    background-color: #1F2D35;
-    background: #2F3A3E;
-    border-right: solid 1px #000;
-    font-weight: bolder;
-}
-
-.SettingsTable td.settingvalue {
-    text-align: left;
-    border-right: solid 1px #000;
-}
-
-/* State indicators */
-.SettingsTable .invalid {
-    background-color: #8b0000;  /* Dark red for errors */
-}
-
-.SettingsTable .disabled {
-    background-color: #CCC;
-    color: #888;
-}
-```
-
-### Responsive Considerations
-
-The router WebUI is not responsive — it targets desktop browsers at ~1024px+ width. Don't add responsive breakpoints; match the existing fixed-width table layout.
-
-## Adapting the WebUI for Modular Providers
-
-### What Needs to Change
-
-1. **Provider dropdown** — Each VPN client row needs a provider selector that drives which options are shown
-2. **Dynamic option groups** — Country lists, VPN types, and protocol options differ by provider. These should populate from the provider's cached data files rather than hardcoded JS arrays
-3. **Remove hardcoded provider arrays** — The current JS has `nordvpncountries=[]`, `piacountries=[]`, `wevpncountries=[]`. Replace with dynamic loading per provider
-4. **Server load display** — Already works per-provider via `getServerLoad`, just needs to dispatch correctly
-
-### WebUI ↔ Provider Data Files
-
-The core script generates data files that the WebUI reads:
-
-```
-/ext/vpnmgr/config.htm              — main settings (all VPN clients)
-/ext/vpnmgr/countries_nordvpn.htm   — NordVPN country list (id|name)
-/ext/vpnmgr/cities_nordvpn_228.htm  — NordVPN cities for country 228 (id|name)
-/ext/vpnmgr/types_nordvpn.htm       — NordVPN VPN types (id|name)
-/ext/vpnmgr/providers.htm           — list of installed providers (name|displayname|version)
-```
-
-These are generated by the core script calling provider functions and writing the output. The WebUI only reads these files — it never calls provider APIs directly.
-
-## Testing the WebUI
-
-1. **On a real router** — SCP the files to `/jffs/addons/vpnmgr.d/` and reload the page
-2. **Browser dev tools** — The router's httpd serves the page; use Chrome/Firefox dev tools to inspect, debug JS, and check network requests
-3. **Standalone mockup** — For layout work, you can serve the ASP as plain HTML locally (the `<% %>` tags won't execute but the structure is visible). Mock the config.htm data with a static file.
-
-## Common Pitfalls
-
-- **`$j` not `$`** — Always use `$j` for jQuery (noConflict mode to avoid clashing with Merlin's prototype.js)
-- **No template literals** — Use `"string" + variable + "string"` concatenation, not backtick strings
-- **`document.form`** — Merlin's standard form reference; don't create your own `<form>` tags
-- **Cache busting** — Append `?ts=` + timestamp to AJAX URLs if stale data is a problem
-- **The httpd is primitive** — It doesn't support all HTTP methods or headers you'd expect. Stick to GET and POST with simple content types
+Fixtures and CI do not establish live router support. Actual served-file hashes,
+Merlin-generated configuration, real authentication, negotiated cipher, traffic
+and reconnect need separately authorized live validation.

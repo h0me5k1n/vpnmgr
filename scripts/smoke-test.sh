@@ -176,12 +176,11 @@ done
 # ---------------------------------------------------------------------------
 section "5. Attribution"
 
-if grep -q 'SCRIPT_REPO=.*h0me5k1n' "${REPO_ROOT}/vpnmgr.sh"; then
-    repo_val=$(grep 'SCRIPT_REPO=' "${REPO_ROOT}/vpnmgr.sh" | head -1 | sed 's/.*="\(.*\)"/\1/')
-    pass "SCRIPT_REPO → ${repo_val}"
+if grep -q 'Originally by h0me5k1n' "${REPO_ROOT}/vpnmgr.sh" && \
+    grep -Fq 'SCRIPT_REPO="https://raw.githubusercontent.com/$SCRIPT_REPOSITORY/$SCRIPT_BRANCH"' "${REPO_ROOT}/vpnmgr.sh"; then
+    pass "Original attribution retained; download source uses the configured repository"
 else
-    actual=$(grep 'SCRIPT_REPO=' "${REPO_ROOT}/vpnmgr.sh" | head -1 || echo "(not found)")
-    fail "SCRIPT_REPO does not point to h0me5k1n — got: ${actual}"
+    fail "Original attribution or configured source construction is missing"
 fi
 
 # ---------------------------------------------------------------------------
@@ -451,57 +450,11 @@ else
     fail "ci.yml: version bump check does not cover WebUI files"
 fi
 
-_SAF_EXTRACT="$(mktemp)"
-sed -n '/^Update_Addon_Files(){/,/^}/p' "${REPO_ROOT}/vpnmgr.sh" > "$_SAF_EXTRACT"
-sed -n '/^Sync_Addon_Files(){/,/^}/p' "${REPO_ROOT}/vpnmgr.sh" >> "$_SAF_EXTRACT"
-# shellcheck source=/dev/null
-. "$_SAF_EXTRACT"
-rm -f "$_SAF_EXTRACT"
-
-_SAF_DIR="$(mktemp -d)"
-SCRIPT_NAME="vpnmgr"
-SCRIPT_VERSION="v9.9.9"
-SCRIPT_FILES_VERSION="${_SAF_DIR}/.files_version"
-WARN=""
-_SAF_LOG=""
-_SAF_FAIL=""
-Print_Output()      { :; }
-Update_File()       { _SAF_LOG="${_SAF_LOG}js "; [[ "$_SAF_FAIL" != "js" ]]; }
-Install_Providers() { _SAF_LOG="${_SAF_LOG}providers "; [[ "$_SAF_FAIL" != "providers" ]]; }
-
-_SAF_LOG=""; Sync_Addon_Files || true
-if [[ "$_SAF_LOG" == "js providers " && "$(cat "$SCRIPT_FILES_VERSION" 2>/dev/null)" == "v9.9.9" ]]; then
-    pass "Sync_Addon_Files: no recorded version -> refreshes and records version"
+if sh "${REPO_ROOT}/scripts/source-download-test.sh"; then
+    pass "Source catch-up: real version/source refresh, failed JS/provider downloads, bootstrap and re-exec contracts"
 else
-    fail "Sync_Addon_Files: no recorded version (calls '${_SAF_LOG}')"
+    fail "Source/download consumer contracts"
 fi
-
-_SAF_LOG=""; Sync_Addon_Files || true
-if [[ -z "$_SAF_LOG" ]]; then
-    pass "Sync_Addon_Files: recorded version matches -> no downloads"
-else
-    fail "Sync_Addon_Files: matching version still downloaded (calls '${_SAF_LOG}')"
-fi
-
-echo "v9.9.8" > "$SCRIPT_FILES_VERSION"
-_SAF_LOG=""; Sync_Addon_Files || true
-if [[ "$_SAF_LOG" == "js providers " && "$(cat "$SCRIPT_FILES_VERSION")" == "v9.9.9" ]]; then
-    pass "Sync_Addon_Files: older recorded version -> refreshes"
-else
-    fail "Sync_Addon_Files: older recorded version (calls '${_SAF_LOG}')"
-fi
-
-for _saf_step in js providers; do
-    echo "v9.9.8" > "$SCRIPT_FILES_VERSION"
-    _SAF_FAIL="$_saf_step"
-    if ! Sync_Addon_Files && [[ "$(cat "$SCRIPT_FILES_VERSION")" == "v9.9.8" ]]; then
-        pass "Sync_Addon_Files: failed ${_saf_step} download -> version not recorded, retried next run"
-    else
-        fail "Sync_Addon_Files: failed ${_saf_step} download recorded as done"
-    fi
-done
-_SAF_FAIL=""
-rm -rf "$_SAF_DIR"
 
 # ---------------------------------------------------------------------------
 # Section 12: Searchable country/city picker (offline)
@@ -622,7 +575,7 @@ section "13. Install source recording (offline)"
 
 _IS_DIR="$(mktemp -d)"
 _IS_EXTRACT="$(mktemp)"
-for _is_fn in Set_Version_Custom_Settings Pin_Script_Repo Record_Install_Source; do
+for _is_fn in Set_Version_Custom_Settings Unpinned_Script_Repo Pin_Script_Repo Script_Source_Identity Record_Install_Source; do
     sed -n "/^${_is_fn}(){/,/^}/p" "${REPO_ROOT}/vpnmgr.sh"
 done | sed "s|/usr/sbin/curl|_is_curl|g; s|/jffs/addons/custom_settings.txt|${_IS_DIR}/custom_settings.txt|g" > "$_IS_EXTRACT"
 # shellcheck source=/dev/null
@@ -630,7 +583,12 @@ done | sed "s|/usr/sbin/curl|_is_curl|g; s|/jffs/addons/custom_settings.txt|${_I
 rm -f "$_IS_EXTRACT"
 
 SCRIPT_NAME="vpnmgr"
+SCRIPT_REPOSITORY="h0me5k1n/vpnmgr"
+SCRIPT_BRANCH_OVERRIDE=""
+SCRIPT_REVISION=""
 SCRIPT_SOURCE_FILE="${_IS_DIR}/.install_source"
+SCRIPT_SOURCE_REVISION_FILE="${_IS_DIR}/.install_revision"
+WARN=""; ERR=""
 _IS_SETTINGS="${_IS_DIR}/custom_settings.txt"
 _IS_REPLY=""
 _is_curl() { printf '%s' "$_IS_REPLY"; }
@@ -649,7 +607,7 @@ assert_eq "Record_Install_Source: develop install recorded for the CLI header" \
 assert_eq "Record_Install_Source: develop install recorded for the WebUI" \
     "vpnmgr_version_source develop@0123456" "$(grep '^vpnmgr_version_source ' "$_IS_SETTINGS")"
 assert_eq "Record_Install_Source: other settings untouched" \
-    "2" "$(grep -c '^vpnmgr_version_local v9.9.9$\|^other_addon_setting 1$' "$_IS_SETTINGS")"
+    "2" "$(grep -Ec '^vpnmgr_version_local v9.9.9$|^other_addon_setting 1$' "$_IS_SETTINGS")"
 
 # The WebUI settings merge skips keys containing "version"; the source key
 # must be one of them or it would be merged into the config and deleted.

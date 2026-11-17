@@ -11,6 +11,31 @@ there). At release it is renamed to the version and date. Never leave an
 empty "## Unreleased" heading; the smoke test rejects one.
 -->
 
+## Unreleased
+
+### Added
+
+- Automatically select NordVPN legacy or modern profiles from the router's built-in OpenVPN version. Report unknown versions explicitly and use the legacy fallback.
+- Separate legacy/modern shared, UDP and TCP custom-settings lists using each client's current provider, transport and logging settings. Choice 7 accepts individual slots, ranges and mixed comma-separated selections.
+- Show backend runtime detection in WebUI Utilities and detailed apply/connection outcomes in the browser console. Reserve each Save before submitting its payload, retain edits on failures and allow continued checking of an unconfirmed request.
+
+### Fixed
+
+- Keep the WebUI runtime readout read-only, with automatic checks on page load and console-only manual diagnostics. Allow the backend a polling interval before the first runtime/apply result read, report missing results and still-ready reservations as informational pending notices, and log the final detection outcome.
+- Use Merlin's standard applying-settings overlay and reload after confirmed success, with clear failures and console diagnostics instead of a permanent Apply status panel. Preserve edits and firmware status polling when completion fails or remains unconfirmed.
+- Restore the managed VPN client list and current custom-setting states before Choice 7's batch-selection prompt.
+- Size the CLI banner to fit the version, router model and development source label, using padding compatible with the router's BusyBox awk and keeping its borders aligned for long branch names.
+- Recover a lost WebUI settings POST by expiring only its unused reservation, preserving edits and late/running request correlation without resubmitting settings. Report clients restored to stopped accurately and retain unavailable location IDs only for unchanged selections.
+- Make normal direct installs verify/refetch their own pinned main script before installing dependencies, with automatic NordVPN visibility in pinned test builds. Preserve ordinary `unknown` branch-fallback reentry and the existing `develop`/`stable` switching paths.
+- Preflight NordVPN CA and control-channel key material before updating active client state. Handle legacy `tls-auth` and modern `tls-crypt`, normalize CRLF profiles and preserve existing certificate verification.
+- Refresh scripts, providers and WebUI assets from one selected revision, including same-version builds. Preserve revision metadata across update re-execution and distinguish completed asset refreshes from installed source provenance.
+- Reject incomplete WebUI settings, preserve unavailable configured providers and rebuild a fresh scalar payload for each Save.
+
+### Repository
+
+- Add offline runtime, preset, profile, backend and source/download fixtures, BusyBox CI execution, WebUI contracts and isolated real-browser journeys. NordVPN is `ACTIVE` following live-account end-to-end validation on a GT-AX11000 running Merlin 388.13 with built-in OpenVPN 2.7.8; native OpenVPN versions below 2.6, exact 2.6, and other router models remain unverified. A separate explicit development flag permits controlled WebUI testing.
+- Refresh contributor guidance for pinned revisions, committed test commands and current WebUI behavior; mark the original bootstrap plan as historical.
+
 ## v3.4.1 (2026-10-25)
 
 ### Fixed
