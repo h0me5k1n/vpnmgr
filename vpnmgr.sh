@@ -1341,6 +1341,11 @@ getAuthDigest(){
 	echo "$1" | grep "^auth " | cut -f2 -d' '
 }
 
+Normalize_OVPN_Profile(){
+	# Provider profiles can use CRLF; line endings are not option/key content.
+	printf '%s\n' "$1" | tr -d '\r'
+}
+
 getClientCA(){
 	echo "$1" | awk '/<ca>/{flag=1;next}/<\/ca>/{flag=0}flag' | sed '/^#/ d'
 }
@@ -1484,6 +1489,7 @@ UpdateVPNConfig(){
 		Print_Output true "Error retrieving VPN server ovpn file" "$ERR"
 		return 1
 	}
+	OVPN_DETAIL="$(Normalize_OVPN_Profile "$OVPN_DETAIL")" || return 1
 	[ -z "$OVPN_DETAIL" ] && Print_Output true "Error retrieving VPN server ovpn file" "$ERR" && return 1
 	if [ "$VPN_PROVIDER_LC" = nordvpn ]; then
 		provider_nordvpn_preflight "$OVPN_DETAIL" || {
@@ -1523,6 +1529,10 @@ UpdateVPNConfig(){
 	}
 	case "$VPN_HMAC" in -1|0|1|2|3|4) ;; *) Print_Output true "Invalid VPN profile TLS control mode" "$ERR"; return 1 ;; esac
 	if [ "$VPN_PROVIDER_LC" = nordvpn ] && [ "$VPN_HMAC" = 3 ]; then
+		[ "$OVPN_RUNTIME_FAMILY" = modern ] || {
+			Print_Output true "Modern NordVPN profiles require a detected OpenVPN version of 2.6 or newer" "$ERR"
+			return 1
+		}
 		OVPN_PROFILE_TLS_MIN="$(printf '%s\n' "$OVPN_DETAIL" | awk '$1 == "tls-version-min" { print $2; exit }')"
 		case "$OVPN_PROFILE_TLS_MIN" in
 			''|1.2) ;;

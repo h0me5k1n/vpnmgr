@@ -44,17 +44,26 @@
 
 AC_PROVIDER=""
 AC_HANDSHAKE="false"
+AC_PROFILE_FAMILIES=""
+AC_PROFILE_FAMILY="legacy"
 for _ac_arg in "$@"; do
 	case "$_ac_arg" in
 		--handshake) AC_HANDSHAKE="true" ;;
+		--profile-family=legacy|--profile-family=modern|--profile-family=both)
+			AC_PROFILE_FAMILIES="${_ac_arg#*=}"
+			[ "$AC_PROFILE_FAMILIES" != both ] || AC_PROFILE_FAMILIES="legacy modern"
+			;;
 		-*)          printf 'Unknown option: %s\n' "$_ac_arg" >&2; exit 3 ;;
 		*)           AC_PROVIDER="$_ac_arg" ;;
 	esac
 done
 
 if [ -z "$AC_PROVIDER" ]; then
-	printf 'Usage: sh scripts/api-check.sh <provider> [--handshake]\n' >&2
+	printf 'Usage: sh scripts/api-check.sh <provider> [--handshake] [--profile-family=legacy|modern|both]\n' >&2
 	exit 3
+fi
+if [ -z "$AC_PROFILE_FAMILIES" ]; then
+	if [ "$AC_PROVIDER" = nordvpn ]; then AC_PROFILE_FAMILIES="legacy modern"; else AC_PROFILE_FAMILIES="legacy"; fi
 fi
 
 AC_REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -390,12 +399,12 @@ mkdir -p "$SCRIPT_DIR" "$OVPN_ARCHIVE_DIR" /jffs/openvpn
 
 # The OVPN parsers and the cipher list are taken from vpnmgr.sh itself so the
 # provider's output is judged by the code the router runs.
-for _ac_fn in getIP getPort getCipher getAuthDigest getClientCA; do
+for _ac_fn in getIP getPort getCipher getAuthDigest getClientCA Default_VPN_Data_Ciphers Normalize_OVPN_Profile; do
 	sed -n "/^${_ac_fn}(){/,/^}/p" "$AC_REPO_ROOT/vpnmgr.sh"
 done > "$AC_WORK/core_parsers.sh"
 # shellcheck source=/dev/null
 . "$AC_WORK/core_parsers.sh"
-AC_NCP_CIPHERS="$(grep -m1 '_ncp_ciphers=' "$AC_REPO_ROOT/vpnmgr.sh" | sed 's/.*_ncp_ciphers="\([^"]*\)".*/\1/')"
+AC_NCP_CIPHERS="$(Default_VPN_Data_Ciphers)"
 
 # shellcheck source=/dev/null
 . "$AC_PROVIDER_FILE"
@@ -456,18 +465,29 @@ _ac_types(){
 }
 
 _ac_get_ovpn(){
-	AC_OVPN="$("provider_${AC_PROVIDER}_get_ovpn" "$AC_SERVER" "$1" "$AC_TYPE")"
+	AC_OVPN="$("provider_${AC_PROVIDER}_get_ovpn" "$AC_SERVER" "$1" "$AC_TYPE" "$AC_PROFILE_FAMILY")" || return 1
+	AC_OVPN="$(Normalize_OVPN_Profile "$AC_OVPN")" || return 1
 	[ -n "$AC_OVPN" ] || return 1
 	AC_MSG="${#AC_OVPN} bytes"
 }
 
-# The same five extractions UpdateVPNConfig() performs; it aborts if any is empty.
+# Match the native profile defaults used by UpdateVPNConfig. Modern NordVPN
+# intentionally omits legacy cipher/auth and uses OpenVPN's negotiated defaults.
 _ac_parse_ovpn(){
 	AC_OVPN_ADDR="$(getIP "$AC_OVPN")"
 	AC_OVPN_PORT="$(getPort "$AC_OVPN")"
 	AC_OVPN_CIPHER="$(getCipher "$AC_OVPN")"
 	AC_OVPN_DIGEST="$(getAuthDigest "$AC_OVPN")"
 	_acp_ca="$(getClientCA "$AC_OVPN")"
+	AC_NCP_CIPHERS="$(printf '%s\n' "$AC_OVPN" | awk '$1 == "data-ciphers" || $1 == "ncp-ciphers" { print $2; exit }')"
+	_acp_hmac="$("provider_${AC_PROVIDER}_get_hmac" "$AC_OVPN")" || return 1
+	if [ "$AC_PROVIDER" = nordvpn ] && [ "$AC_PROFILE_FAMILY" = modern ] && [ "$_acp_hmac" = 3 ]; then
+		[ -n "$AC_OVPN_CIPHER" ] || AC_OVPN_CIPHER=default
+		[ -n "$AC_OVPN_DIGEST" ] || AC_OVPN_DIGEST=default
+	elif [ -z "$AC_NCP_CIPHERS" ]; then
+		AC_NCP_CIPHERS="$(Default_VPN_Data_Ciphers)"
+	fi
+	case "$AC_NCP_CIPHERS" in *[!a-zA-Z0-9:_-]*) return 1 ;; esac
 	AC_MSG="remote=$AC_OVPN_ADDR port=$AC_OVPN_PORT cipher=$AC_OVPN_CIPHER auth=$AC_OVPN_DIGEST"
 	[ -n "$AC_OVPN_ADDR" ] && [ -n "$AC_OVPN_PORT" ] && [ -n "$AC_OVPN_CIPHER" ] \
 		&& [ -n "$AC_OVPN_DIGEST" ] && [ -n "$_acp_ca" ] || return 1
@@ -514,7 +534,7 @@ _ac_handshake(){
 	_ach_crl="${2:-crl}"
 	_ach_conf="$AC_WORK/probe_${_ach_prot}.conf"
 	_ach_log="$AC_WORK/probe_${_ach_prot}.log"
-	_ach_hmac="$("provider_${AC_PROVIDER}_get_hmac")"
+	_ach_hmac="$("provider_${AC_PROVIDER}_get_hmac" "$AC_OVPN")" || return 1
 	_ach_static="/jffs/openvpn/vpn_crt_client1_static"
 	AC_HS_RESULT=""
 
@@ -525,9 +545,9 @@ _ac_handshake(){
 		printf 'client\ndev null\nnobind\n'
 		if [ "$_ach_prot" = "TCP" ]; then printf 'proto tcp-client\n'; else printf 'proto udp\n'; fi
 		printf 'remote %s %s\n' "$AC_OVPN_ADDR" "$AC_OVPN_PORT"
-		printf 'auth %s\n' "$AC_OVPN_DIGEST"
-		printf 'data-ciphers %s\n' "$AC_NCP_CIPHERS"
-		printf 'data-ciphers-fallback %s\n' "$AC_OVPN_CIPHER"
+		[ "$AC_OVPN_DIGEST" = default ] || printf 'auth %s\n' "$AC_OVPN_DIGEST"
+		[ -z "$AC_NCP_CIPHERS" ] || printf 'data-ciphers %s\n' "$AC_NCP_CIPHERS"
+		[ "$AC_OVPN_CIPHER" = default ] || printf 'data-ciphers-fallback %s\n' "$AC_OVPN_CIPHER"
 		printf 'ca /jffs/openvpn/vpn_crt_client1_ca\n'
 		if [ -s "$_ach_static" ]; then
 			case "$_ach_hmac" in
@@ -653,7 +673,9 @@ for AC_PROT in UDP TCP; do
 		ac_skip "get_ovpn $AC_PROT — no server selected"
 		continue
 	fi
-	if ! ac_check_net "get_ovpn" _ac_get_ovpn "$AC_PROT"; then
+	for AC_PROFILE_FAMILY in $AC_PROFILE_FAMILIES; do
+	ac_section "Profile family — $AC_PROFILE_FAMILY $AC_PROT"
+	if ! ac_check_net "get_ovpn ($AC_PROFILE_FAMILY)" _ac_get_ovpn "$AC_PROT"; then
 		continue
 	fi
 	ac_check "OVPN parses with vpnmgr.sh getIP/getPort/getCipher/getAuthDigest/getClientCA" _ac_parse_ovpn || continue
@@ -662,7 +684,7 @@ for AC_PROT in UDP TCP; do
 	if command -v openssl >/dev/null 2>&1; then
 		ac_check "CA certificate is valid" _ac_ca_validity
 	fi
-	_ac_hmac_now="$("provider_${AC_PROVIDER}_get_hmac")"
+	_ac_hmac_now="$("provider_${AC_PROVIDER}_get_hmac" "$AC_OVPN")"
 	case "$_ac_hmac_now" in
 		0|1|2|3|4)
 			[ -s /jffs/openvpn/vpn_crt_client1_static ] \
@@ -672,6 +694,7 @@ for AC_PROT in UDP TCP; do
 	if [ "$AC_HANDSHAKE" = "true" ]; then
 		ac_handshake "$AC_PROT"
 	fi
+	done
 done
 
 # ---------------------------------------------------------------------------

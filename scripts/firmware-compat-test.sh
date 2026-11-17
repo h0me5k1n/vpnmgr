@@ -11,7 +11,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -subj /CN=offline-fixture -days 1 -keyout "$_FW_TEST_DIR/fixture.key" \
     -out "$_FW_TEST_DIR/fixture.crt" >/dev/null 2>&1
 
-for fn in Firmware_Number_Check Firmware_Build_Before Validate_Number \
+for fn in Firmware_Number_Check Firmware_Build_Before Validate_Number Normalize_OVPN_Profile Default_VPN_Data_Ciphers \
     getIP getPort getCipher getAuthDigest getClientCA getConnectState \
     UpdateVPNConfig SetVPNCustomSettings Write_VPNCustomOptions Toggle_VPN_Custom_Settings Strip_Stale_X509Name; do
     sed -n "/^${fn}(){/,/^}/p" "$FW_TEST_SOURCE"
@@ -60,7 +60,7 @@ nvram() {
 Print_Output() { :; }
 Load_Provider() { [[ "$1" == nordvpn ]]; }
 OpenVPN_Version_Number() { printf '2007000\n'; }
-Detect_OpenVPN_Runtime() { OVPN_RUNTIME_VERSION=2.7.0; OVPN_RUNTIME_NUMBER=2007000; OVPN_RUNTIME_FAMILY=modern; OVPN_RUNTIME_STATUS=detected; }
+Detect_OpenVPN_Runtime() { OVPN_RUNTIME_VERSION=2.7.0; OVPN_RUNTIME_NUMBER=2007000; OVPN_RUNTIME_FAMILY="${FW_TEST_RUNTIME_FAMILY:-modern}"; OVPN_RUNTIME_STATUS=detected; }
 provider_nordvpn_get_server() { printf 'au1123.nordvpn.com\n'; }
 provider_nordvpn_get_ovpn() { [[ "${FW_TEST_DOWNLOAD_FAIL:-false}" == false ]] || return 1; printf '%s\n' "$FW_TEST_PROFILE"; }
 provider_nordvpn_get_short_name() { printf 'AU1123\n'; }
@@ -143,6 +143,8 @@ tls-version-min 1.2
         legacy_badport) FW_TEST_PROFILE="${FW_TEST_PROFILE/ 1231/ invalid}" ;;
         legacy_badproto) FW_TEST_PROFILE="${FW_TEST_PROFILE/proto udp/proto tcp-client}" ;;
         modern_downloadfail) FW_TEST_DOWNLOAD_FAIL=true ;;
+        modern_legacyclient) FW_TEST_RUNTIME_FAMILY=legacy ;;
+        modern_crlf) FW_TEST_PROFILE="$(printf '%s\n' "$FW_TEST_PROFILE" | awk '{printf "%s\r\n", $0}')" ;;
     esac
     if [[ "$pin" == pin ]]; then
         printf 'verify-x509-name CN=au1164.nordvpn.com\nremote-cert-tls server\n' \
@@ -160,7 +162,7 @@ tls-version-min 1.2
         printf 'remote-cert-tls server\nkey-direction 1\n' > "$_FW_TEST_DIR/openvpn/vpn_client1_custom3"
     fi
 
-    if [[ "$profile" == *badkey || "$profile" == *badca || "$profile" == *badport || "$profile" == *badproto || "$profile" == *downloadfail || "$profile" == *missingtrust || "$profile" == *conflict ]]; then
+    if [[ "$profile" == *badkey || "$profile" == *badca || "$profile" == *badport || "$profile" == *badproto || "$profile" == *downloadfail || "$profile" == *missingtrust || "$profile" == *conflict || "$profile" == *legacyclient ]]; then
         cp "$_FW_TEST_DIR/openvpn/vpn_client1_custom3" "$_FW_TEST_DIR/before-options"
         if UpdateVPNConfig unattended 1 2; then die "$label accepted a rejected profile"; fi
         [[ ! -s "$FW_TEST_NVRAM_LOG" ]] || die "$label wrote NVRAM before preflight"
@@ -172,7 +174,7 @@ tls-version-min 1.2
 
     UpdateVPNConfig unattended 1 2
 
-    if [[ "$profile" == modern ]]; then
+    if [[ "$profile" == modern || "$profile" == modern_crlf ]]; then
         grep -qx 'vpn_client1_hmac=3' "$FW_TEST_NVRAM_LOG" || die "$label wrong TLS mode"
         grep -qx 'vpn_client1_ncp_ciphers=' "$FW_TEST_NVRAM_LOG" || die "$label overrode modern cipher defaults"
         grep -qx 'vpn_client1_cipher=default' "$FW_TEST_NVRAM_LOG" || die "$label retained stale cipher"
@@ -180,7 +182,7 @@ tls-version-min 1.2
     else
         grep -qx 'vpn_client1_hmac=1' "$FW_TEST_NVRAM_LOG" || die "$label wrong TLS mode"
     fi
-    if [[ "$managed" == true && "$protocol" == UDP && ( "$profile" == legacy || "$profile" == modern ) ]]; then
+    if [[ "$managed" == true && "$protocol" == UDP && ( "$profile" == legacy || "$profile" == modern || "$profile" == modern_crlf ) ]]; then
         provider_nordvpn_write_certs_real 1 "$FW_TEST_PROFILE" || die "$label real certificate write"
         cmp -s "$_FW_TEST_DIR/fixture.crt" "$_FW_TEST_DIR/openvpn/vpn_crt_client1_ca" || die "$label wrong CA written"
         grep -qx -- '-----BEGIN OpenVPN Static key V1-----' "$_FW_TEST_DIR/openvpn/vpn_crt_client1_static" || die "$label wrong static key written"
@@ -244,4 +246,16 @@ run_case 'legacy protocol mismatch rejected before writes' 3.0.0.4 388.12 none 0
 run_case 'modern download failure rejected before writes' 3.0.0.6 102.9 none 0 file true nopin modern_downloadfail
 run_case 'modern missing server verification rejected before writes' 3.0.0.6 102.9 none 0 file false nopin modern_missingtrust
 run_case 'modern conflicting custom TLS rejected before writes' 3.0.0.6 102.9 none 0 file false nopin modern_conflict
-printf 'All 26 firmware consumer cases passed.\n'
+run_case 'modern profile rejected for legacy detected client' 3.0.0.6 102.9 none 0 file true nopin modern_legacyclient
+run_case 'modern CRLF UDP managed' 3.0.0.6 102.9 none 0 file true nopin modern_crlf UDP
+run_case 'modern CRLF TCP user managed' 3.0.0.6 102.9 none 0 file false nopin modern_crlf TCP
+
+# Exercise the actual writer's I/O failure rather than replacing it with a stub.
+_FW_WRITER_PROFILE="$(printf '<ca>\n'; cat "$_FW_TEST_DIR/fixture.crt"; printf '</ca>\nkey-direction 1\n<tls-auth>\n';
+    awk 'BEGIN {print "-----BEGIN OpenVPN Static key V1-----"; for(i=0;i<16;i++) printf "%032d\n",0; print "-----END OpenVPN Static key V1-----"}'; printf '</tls-auth>\n')"
+mkdir "$_FW_TEST_DIR/openvpn/vpn_crt_client2_ca"
+if provider_nordvpn_write_certs_real 2 "$_FW_WRITER_PROFILE" 2> "$_FW_TEST_DIR/writer-error"; then
+    die 'certificate writer masked an actual filesystem error'
+fi
+printf '  PASS: certificate writer reports actual filesystem failure\n'
+printf 'All 30 firmware consumer/writer cases passed.\n'

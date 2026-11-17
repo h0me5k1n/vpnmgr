@@ -39,6 +39,8 @@ if [ $# -eq 0 ]; then
 fi
 
 PROVIDER="$1"
+PROFILE_FAMILY="${2:-legacy}"
+case "$PROFILE_FAMILY" in legacy|modern) ;; *) echo 'Profile family must be legacy or modern' >&2; exit 1 ;; esac
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROVIDER_SCRIPT="$REPO_ROOT/providers/provider_${PROVIDER}.sh"
 
@@ -265,7 +267,7 @@ else
     # get_ovpn
     if [ -n "$server" ]; then
         start=$(date +%s%3N)
-        ovpn_content=$(call get_ovpn "$server" "UDP" "Standard" 2>/dev/null) && {
+        ovpn_content=$(call get_ovpn "$server" "UDP" "Standard" "$PROFILE_FAMILY" 2>/dev/null) && {
             end=$(date +%s%3N); elapsed=$(( end - start ))
             byte_count=${#ovpn_content}
             _pass "get_ovpn [${elapsed}ms] — ${byte_count} bytes"
@@ -281,7 +283,7 @@ else
 
     # write_certs dry run
     # CA cert is required by all providers.
-    # Secondary block varies: <tls-auth> (NordVPN) or <crl-verify> (PIA).
+    # Secondary block varies: tls-auth/tls-crypt (NordVPN) or crl-verify (PIA).
     echo ""
     echo -e "${BOLD_FMT}write_certs (dry run)${NC}"
     if [ -n "$ovpn_content" ]; then
@@ -295,6 +297,9 @@ else
             | awk '/<tls-auth>/{flag=1;next}/<\/tls-auth>/{flag=0}flag' | sed '/^#/ d')
         if [ -n "$_tls" ]; then
             _secondary="$_tls"; _secondary_label="tls-auth"; _secondary_file="static"
+        elif printf '%s\n' "$ovpn_content" | grep -q '^<tls-crypt>'; then
+            _secondary=$(printf '%s\n' "$ovpn_content" | awk '/<tls-crypt>/{flag=1;next}/<\/tls-crypt>/{flag=0}flag' | sed '/^#/ d')
+            _secondary_label="tls-crypt"; _secondary_file="static"
         else
             _crl=$(printf '%s' "$ovpn_content" \
                 | awk '/<crl-verify>/{flag=1;next}/<\/crl-verify>/{flag=0}flag' | sed '/^#/ d')
