@@ -14,6 +14,119 @@ var providerTypes = {
 var refreshcacheddatainterval;
 var getserverloadinterval;
 var vpnmgr_initComplete = false;
+var vpnmgr_configState = 'loading';
+var vpnmgr_runtimeState = 'loading';
+var vpnmgr_runtime = null;
+var vpnmgr_pendingApply = null;
+var vpnmgr_lastRequestId = '';
+var vpnmgr_runtimePending = null;
+
+function SetText(selector,text){
+	$j(selector).text(text);
+}
+
+function CanSaveConfig(){
+	var validRuntime = vpnmgr_runtimeState == 'known' || vpnmgr_runtimeState == 'unknown';
+	var canSave = vpnmgr_initComplete && vpnmgr_configState == 'loaded' && validRuntime && !vpnmgr_pendingApply;
+	$j('#btnSaveConfig').prop('disabled',!canSave);
+}
+
+function NewRuntimeRequestId(){
+	var stamp = String(new Date().getTime());
+	var randomPart = String(Math.floor(Math.random()*1000000));
+	while(randomPart.length < 6) randomPart = '0'+randomPart;
+	var requestId = stamp+randomPart;
+	if(requestId.length > 19) requestId = requestId.substring(requestId.length-19);
+	if(requestId == vpnmgr_lastRequestId){
+		requestId = requestId.substring(0,18)+String((parseInt(requestId.substring(18),10)+1)%10);
+	}
+	vpnmgr_lastRequestId = requestId;
+	return requestId;
+}
+
+function IsRuntimeDetection(data,requestId){
+	return data && typeof data == 'object' && data.request === requestId && data.state === 'done' &&
+		typeof data.version == 'string' && typeof data.number == 'string' &&
+		(data.family === 'legacy' || data.family === 'modern') &&
+		(data.status === 'detected' || data.status === 'unknown') &&
+		(data.status == 'detected' ? (data.version !== '' && data.number !== '') : (data.family === 'legacy' && data.version === '' && data.number === ''));
+}
+
+function DetectRuntime(){
+	var requestId = NewRuntimeRequestId();
+	var pending = {requestId:requestId,startedAt:new Date().getTime(),polling:false};
+	vpnmgr_runtimePending = pending;
+	vpnmgr_runtimeState = 'loading';
+	vpnmgr_runtime = null;
+	CanSaveConfig();
+	SetText('#vpnmgr_runtime_status','Checking router OpenVPN version…');
+	var fields = $j(document.formScriptActions).serializeArray();
+	for(var i=0; i<fields.length; i++) if(fields[i].name == 'action_script') fields[i].value = 'start_vpnmgrruntime_'+requestId;
+	$j.ajax({
+		url:'/start_apply.htm',
+		type:'POST',
+		data:fields,
+		dataType:'text',
+		cache:false,
+		timeout:15000,
+		error:function(){ BeginRuntimePolling(pending); },
+		success:function(){ BeginRuntimePolling(pending); }
+	});
+}
+
+function BeginRuntimePolling(pending){
+	if(vpnmgr_runtimePending !== pending || pending.polling) return;
+	pending.polling = true;
+	PollRuntimeStatus(pending);
+}
+
+function PollRuntimeStatus(pending){
+	if(vpnmgr_runtimePending !== pending || !pending.polling || vpnmgr_lastRequestId != pending.requestId) return;
+	if(new Date().getTime()-pending.startedAt >= 120000){
+		FinishRuntimeFailure(pending,'Runtime check timed out. Retry before saving; router fallback has not been assumed.');
+		return;
+	}
+	$j.ajax({
+		url:'/ext/vpnmgr/runtime/detection_'+pending.requestId+'.json',
+		dataType:'json',cache:false,timeout:10000,
+		error:function(){
+			if(vpnmgr_runtimePending !== pending || !pending.polling) return;
+			setTimeout(function(){PollRuntimeStatus(pending);},2000);
+		},
+		success:function(data){
+			if(vpnmgr_runtimePending !== pending || !pending.polling || vpnmgr_lastRequestId != pending.requestId) return;
+			if(!data || data.request !== pending.requestId || data.state !== 'done'){
+				setTimeout(function(){PollRuntimeStatus(pending);},2000);
+				return;
+			}
+			if(!IsRuntimeDetection(data,pending.requestId)){
+				FinishRuntimeFailure(pending,'Runtime response was malformed or did not match this check. Retry before saving.');
+				return;
+			}
+			pending.polling = false;
+			vpnmgr_runtimePending = null;
+			vpnmgr_runtime = data;
+			if(data.status == 'unknown'){
+				vpnmgr_runtimeState = 'unknown';
+				SetText('#vpnmgr_runtime_status','OpenVPN runtime version is unknown. The router will use its documented legacy fallback.');
+			}
+			else{
+				vpnmgr_runtimeState = 'known';
+				SetText('#vpnmgr_runtime_status','OpenVPN '+data.version+' ('+data.family+' runtime).');
+			}
+			CanSaveConfig();
+		}
+	});
+}
+
+function FinishRuntimeFailure(pending,message){
+	if(vpnmgr_runtimePending !== pending) return;
+	pending.polling = false;
+	vpnmgr_runtimePending = null;
+	vpnmgr_runtimeState = 'failed';
+	SetText('#vpnmgr_runtime_status',message);
+	CanSaveConfig();
+}
 
 function SettingHint(hintid){
 	var tag_name = document.getElementsByTagName('a');
@@ -343,30 +456,70 @@ function Validate_All(){
 	}
 }
 
+function LoadedSettingsValid(settings){
+	var values = {};
+	for(var row=0; row<settings.length; row++) values[settings[row][0]] = settings[row][1];
+	var required = ['managed','provider','customsettings','protocol','type','countryname','cityname','schenabled','schhours','schmins','schdays'];
+	for(var slot=1; slot<=5; slot++){
+		var prefix = 'vpn'+slot+'_';
+		for(var field=0; field<required.length; field++) if(!Object.prototype.hasOwnProperty.call(values,prefix+required[field])) return false;
+		var flags = ['managed','customsettings','schenabled'];
+		for(var flag=0; flag<flags.length; flag++) if(values[prefix+flags[flag]] != 'true' && values[prefix+flags[flag]] != 'false') return false;
+		if(!/^(tcp|udp)$/i.test(values[prefix+'protocol'])) return false;
+	}
+	return true;
+}
+
 function get_conf_file(){
+	vpnmgr_configState = 'loading';
+	vpnmgr_initComplete = false;
+	SetText('#vpnmgr_config_status','Loading saved settings…');
+	$j('#btnConfigRetry').hide();
+	CanSaveConfig();
 	$j.ajax({
 		url: '/ext/vpnmgr/config.htm',
 		dataType: 'text',
+		cache: false,
+		timeout: 15000,
 		error: function(xhr){
-			setTimeout(get_conf_file,1000);
+			vpnmgr_configState = 'failed';
+			SetText('#vpnmgr_config_status','Settings could not be loaded. Existing form values have been preserved.');
+			$j('#btnConfigRetry').show();
+			CanSaveConfig();
 		},
 		success: function(data){
+			if(typeof data != 'string' || data.indexOf('=') == -1){
+				vpnmgr_configState = 'failed';
+				SetText('#vpnmgr_config_status','Settings response was empty or malformed. Existing form values have been preserved.');
+				$j('#btnConfigRetry').show();
+				CanSaveConfig();
+				return;
+			}
 			var settings = data.split('\n');
 			settings.reverse();
 			settings = settings.filter(Boolean);
-			var settingcount = settings.length;
 			window['vpnmgr_settings'] = [];
-			for (var i = 0; i < settingcount; i++){
-				if (settings[i].indexOf('#') != -1){
+			for (var i = 0; i < settings.length; i++){
+				var line = settings[i].replace(/\r$/,'');
+				if (line.charAt(0) == '#'){
 					continue
 				}
-				var setting = settings[i].split('=');
+				var equalsAt = line.indexOf('=');
+				if(equalsAt < 1) continue;
+				var setting = [line.substring(0,equalsAt),line.substring(equalsAt+1)];
 				window['vpnmgr_settings'].unshift(setting);
-				}
-				
-				for (var vpnno = 5; vpnno >= 1; vpnno--){
-					$j('#table_scripttools').after(BuildConfigTable('vpn'+vpnno,'VPN Client '+vpnno));
-				}
+			}
+			if(!LoadedSettingsValid(window['vpnmgr_settings'])){
+				vpnmgr_configState = 'failed';
+				SetText('#vpnmgr_config_status','Settings response was incomplete or malformed. Existing form values have been preserved.');
+				$j('#btnConfigRetry').show();
+				CanSaveConfig();
+				return;
+			}
+			$j('[id^="table_config_vpn"]').remove();
+			for (var vpnno = 5; vpnno >= 1; vpnno--){
+				$j('#table_scripttools').after(BuildConfigTable('vpn'+vpnno,'VPN Client '+vpnno));
+			}
 				
 				for (var i = 0; i < window['vpnmgr_settings'].length; i++){
 					var settingname = window['vpnmgr_settings'][i][0];
@@ -375,11 +528,17 @@ function get_conf_file(){
 					if(settingname.indexOf('schdays') == -1){
 						var vpnmgr_field = document.form['vpnmgr_'+settingname];
 						if (vpnmgr_field) {
-							vpnmgr_field.value = settingvalue;
+							if(vpnmgr_field.length && !vpnmgr_field.tagName){
+								for(var radioIndex=0; radioIndex<vpnmgr_field.length; radioIndex++) vpnmgr_field[radioIndex].checked = vpnmgr_field[radioIndex].value.toLowerCase() == settingvalue.toLowerCase();
+							}
+							else vpnmgr_field.value = settingvalue;
 						}
 						if(settingname.indexOf('managed') != -1) OptionsEnableDisable($j('#vpnmgr_'+settingname.replace('_managed','')+'_man_'+settingvalue)[0],true);
 						if(settingname.indexOf('schenabled') != -1) ScheduleOptionsEnableDisable($j('#vpnmgr_'+settingname.replace('_schenabled','')+'_sch_'+settingvalue)[0]);
-						if(settingname.indexOf('provider') != -1) VPNTypesToggle($j('#vpnmgr_'+settingname.replace('_provider','')+'_prov_'+settingvalue.toLowerCase())[0]);
+						if(settingname.indexOf('provider') != -1){
+							var providerRadio = $j('#vpnmgr_'+settingname.replace('_provider','')+'_prov_'+settingvalue.toLowerCase())[0];
+							if(providerRadio){ providerRadio.checked = true; VPNTypesToggle(providerRadio); }
+						}
 					}
 					else{
 						if(settingvalue == '*'){
@@ -398,9 +557,10 @@ function get_conf_file(){
 				
 				PopulateCountryDropdown('all');
 				for (var i = 1; i < 6; i++){
-					eval('document.form.vpnmgr_vpn'+i+'_countryname').value = window['vpnmgr_settings'].filter(function(item){
-						return item[0] == 'vpn'+i+'_countryname';
-					})[0][1];
+					var countrySelect = document.form['vpnmgr_vpn'+i+'_countryname'];
+					var savedCountry = GetLoadedSetting('vpn'+i+'_countryname');
+					EnsureSelectValue(countrySelect,savedCountry,'Unavailable: '+savedCountry);
+					countrySelect.value = savedCountry;
 					
 					if(eval('document.form.vpnmgr_vpn'+i+'_countryname').value == ''){
 						$j('#vpnmgr_vpn'+i+'_cityname').prop('disabled',true);
@@ -417,9 +577,10 @@ function get_conf_file(){
 				PopulateCityDropdown('all');
 				
 				for (var i = 1; i < 6; i++){
-					eval('document.form.vpnmgr_vpn'+i+'_cityname').value = window['vpnmgr_settings'].filter(function(item){
-						return item[0] == 'vpn'+i+'_cityname';
-					})[0][1];
+					var citySelect = document.form['vpnmgr_vpn'+i+'_cityname'];
+					var savedCity = GetLoadedSetting('vpn'+i+'_cityname');
+					EnsureSelectValue(citySelect,savedCity,'Unavailable: '+savedCity);
+					citySelect.value = savedCity;
 					
 					if((eval('document.form.vpnmgr_vpn'+i+'_cityname').length == 0) || (eval('document.form.vpnmgr_vpn'+i+'_cityname').length == 1 && eval('document.form.vpnmgr_vpn'+i+'_cityname').value == '')){
 						$j('#vpnmgr_vpn'+i+'_cityname').prop('disabled',true);
@@ -455,8 +616,31 @@ function get_conf_file(){
 
 				AddEventHandlers();
 				vpnmgr_initComplete = true;
+				vpnmgr_configState = 'loaded';
+				SetText('#vpnmgr_config_status','Saved settings loaded.');
+				CanSaveConfig();
 			}
 	});
+}
+
+function GetLoadedSetting(name){
+	var settings = window['vpnmgr_settings'] || [];
+	for(var i=0; i<settings.length; i++) if(settings[i][0] == name) return settings[i][1];
+	return '';
+}
+
+function EnsureSelectValue(select,value,label){
+	if(!select || !value) return;
+	for(var i=0; i<select.options.length; i++) if(select.options[i].value == value) return;
+	var option = document.createElement('option');
+	option.value = value;
+	option.text = label;
+	select.appendChild(option);
+}
+
+function RetryConfigLoad(){
+	if(vpnmgr_configState == 'loaded') return;
+	get_conf_file();
 }
 
 function GetCookie(cookiename,returntype){
@@ -491,10 +675,16 @@ function pass_checked(obj,showobj){
 }
 
 function SaveConfig(){
-	if (!vpnmgr_initComplete) {
-		alert('Settings have not finished loading yet. Please reload the page and try again before saving.');
+	CanSaveConfig();
+	if (!vpnmgr_initComplete || vpnmgr_configState != 'loaded') {
+		alert('Settings have not loaded successfully yet. Retry the settings load before saving.');
 		return false;
 	}
+	if(vpnmgr_runtimeState != 'known' && vpnmgr_runtimeState != 'unknown'){
+		alert('A valid router OpenVPN runtime check is required before saving. Retry the runtime check first.');
+		return false;
+	}
+	if(vpnmgr_pendingApply) return false;
 	if(Validate_All()){
 		for(var i=1; i < 6; i++){
 			if(eval('document.form.vpn'+i+'_schedulemode').value == 'EveryX'){
@@ -515,25 +705,273 @@ function SaveConfig(){
 				}
 			}
 		}
-		
-		$j('[name*=vpnmgr_]').prop('disabled',false);
-		document.getElementById('amng_custom').value = JSON.stringify($j('form').serializeObject());
-		var action_script_tmp = 'start_vpnmgr';
-		document.form.action_script.value = action_script_tmp;
-		var restart_time = 15;
-		document.form.action_wait.value = restart_time;
-		showLoading();
-		document.form.submit();
+		for(var slot=1; slot<6; slot++){
+			var providerInput = $j('input[name="vpnmgr_vpn'+slot+'_provider"]:checked')[0];
+			var managedInput = $j('input[name="vpnmgr_vpn'+slot+'_managed"]:checked')[0];
+			if(managedInput && managedInput.value == 'true' && (!providerInput || !IsProviderAvailable(providerInput.value))){
+				alert('VPN Client '+slot+' uses a provider that is unavailable in providers.htm. Select an available provider or disable management for this client before saving.');
+				return false;
+			}
+		}
+		var requestId = NewRuntimeRequestId();
+		var payload = BuildCustomSettingsPayload(requestId);
+		var fields = CollectFormFields('start_vpnmgrapply_'+requestId,payload);
+		vpnmgr_pendingApply = {requestId:requestId,payload:payload,fields:fields,phase:'prepare',startedAt:0,polling:false};
+		FreezeConfigControls(vpnmgr_pendingApply);
+		SetApplySummary('Reserving a settings apply (request '+requestId+').');
+		for(var client=1; client<=5; client++) SetText('#vpnmgr_client_status_'+client,'waiting');
+		$j('#btnReloadSettings').hide();
+		$j('#btnContinueApply').hide();
+		CanSaveConfig();
+		PrepareApply(vpnmgr_pendingApply);
 	}
 	else{
 		return false;
 	}
 }
 
+function IsConfigFormControl(element){
+	if(!element || !element.name || element.type == 'hidden') return false;
+	return element.name.indexOf('vpnmgr_vpn') === 0 || /^vpn[1-5]_(schedulemode|everyxselect|everyxvalue)$/.test(element.name);
+}
+
+function FreezeConfigControls(pending){
+	pending.disabledControls = [];
+	var elements = document.form.elements;
+	for(var i=0; i<elements.length; i++){
+		if(!IsConfigFormControl(elements[i])) continue;
+		pending.disabledControls.push({element:elements[i],disabled:elements[i].disabled});
+		elements[i].disabled = true;
+	}
+}
+
+function RestoreConfigControls(pending){
+	var controls = pending.disabledControls || [];
+	for(var i=0; i<controls.length; i++) controls[i].element.disabled = controls[i].disabled;
+	pending.disabledControls = [];
+}
+
+function IsProviderAvailable(value){
+	var normalized = String(value || '').toLowerCase();
+	for(var i=0; i<vpnmgr_providers.length; i++){
+		if(vpnmgr_providers[i].id.toLowerCase() == normalized || vpnmgr_providers[i].name.toLowerCase() == normalized) return true;
+	}
+	return false;
+}
+
+function BuildCustomSettingsPayload(requestId){
+	var output = {};
+	var source = custom_settings || {};
+	for(var key in source) if(Object.prototype.hasOwnProperty.call(source,key)) output[key] = source[key];
+	var elements = document.form.elements;
+	for(var i=0; i<elements.length; i++){
+		var element = elements[i];
+		if(!element.name || element.name.indexOf('vpnmgr_vpn') !== 0 || element.name.indexOf('version') != -1 || element.name == 'amng_custom') continue;
+		if(element.name.indexOf('_schdays') != -1 || element.name.indexOf('_countryid') != -1 || element.name.indexOf('_cityid') != -1) continue;
+		if(element.type == 'radio' || element.type == 'checkbox'){
+			if(!element.checked) continue;
+		}
+		output[element.name] = element.value || '';
+	}
+	for(var slot=1; slot<6; slot++){
+		var dayValues = [];
+		var dayInputs = document.form.elements['vpnmgr_vpn'+slot+'_schdays'];
+		if(dayInputs){
+			if(!dayInputs.length) dayInputs = [dayInputs];
+			for(var d=0; d<dayInputs.length; d++) if(dayInputs[d].checked) dayValues.push(dayInputs[d].value);
+		}
+		var dayText = dayValues.join(',');
+		output['vpnmgr_vpn'+slot+'_schdays'] = dayText == 'Mon,Tues,Wed,Thurs,Fri,Sat,Sun' ? '*' : dayText;
+		var provider = output['vpnmgr_vpn'+slot+'_provider'] || '';
+		var country = output['vpnmgr_vpn'+slot+'_countryname'] || '';
+		var city = output['vpnmgr_vpn'+slot+'_cityname'] || '';
+		if(provider.toLowerCase() == 'nordvpn' && country){
+			var countries = providerCountries.nordvpn || [];
+			var countryEntry = null;
+			for(var c=0; c<countries.length; c++) if(countries[c].name == country){ countryEntry = countries[c]; break; }
+			if(countryEntry){
+				output['vpnmgr_vpn'+slot+'_countryid'] = countryEntry.id || 0;
+				var cityId = 0;
+				var cities = countryEntry.cities || [];
+				for(var ci=0; ci<cities.length; ci++) if(cities[ci].name == city){ cityId = cities[ci].id || 0; break; }
+				output['vpnmgr_vpn'+slot+'_cityid'] = cityId;
+			}
+			else{
+				output['vpnmgr_vpn'+slot+'_countryid'] = source['vpnmgr_vpn'+slot+'_countryid'] || GetLoadedSetting('vpn'+slot+'_countryid') || 0;
+				output['vpnmgr_vpn'+slot+'_cityid'] = source['vpnmgr_vpn'+slot+'_cityid'] || GetLoadedSetting('vpn'+slot+'_cityid') || 0;
+			}
+		}
+		else{
+			output['vpnmgr_vpn'+slot+'_countryid'] = 0;
+			output['vpnmgr_vpn'+slot+'_cityid'] = 0;
+		}
+	}
+	output.vpnmgr_request_id = requestId;
+	return output;
+}
+
+function CollectFormFields(actionScript,customPayload){
+	var fields = [];
+	var elements = document.form.elements;
+	for(var i=0; i<elements.length; i++){
+		var element = elements[i];
+		if(!element.name || element.name == 'button' || element.name.indexOf('show_pass_') === 0) continue;
+		if(element.type == 'radio' || element.type == 'checkbox') if(!element.checked) continue;
+		fields.push({name:element.name,value:element.name == 'action_script' ? actionScript : element.name == 'amng_custom' ? JSON.stringify(customPayload) : element.value});
+	}
+	return fields;
+}
+
+function PrepareApply(pending){
+	var fields = $j(document.formScriptActions).serializeArray();
+	for(var i=0; i<fields.length; i++) if(fields[i].name == 'action_script') fields[i].value = 'start_vpnmgrprepare_'+pending.requestId;
+	$j.ajax({
+		url:'/start_apply.htm',method:'POST',type:'POST',data:fields,dataType:'text',cache:false,timeout:15000,
+		error:function(){ SetApplySummary('Could not confirm the reservation request. Checking its status.'); BeginApplyPolling(pending,'prepare'); },
+		success:function(){ BeginApplyPolling(pending,'prepare'); }
+	});
+}
+
+function BeginApplyPolling(pending,phase){
+	if(vpnmgr_pendingApply !== pending || pending.polling) return;
+	pending.phase = phase;
+	pending.polling = true;
+	pending.startedAt = new Date().getTime();
+	PollApplyStatus(pending);
+}
+
+function ContinueApplyChecking(){
+	var pending = vpnmgr_pendingApply;
+	if(!pending || pending.polling) return;
+	$j('#btnContinueApply').hide();
+	BeginApplyPolling(pending,pending.phase);
+}
+
+function PollApplyStatus(pending){
+	if(vpnmgr_pendingApply !== pending || !pending.polling) return;
+	if(new Date().getTime()-pending.startedAt >= 120000){
+		pending.polling = false;
+		SetApplySummary('Completion is not confirmed yet. The same request remains active; continue checking to view its status.');
+		$j('#btnContinueApply').show();
+		return;
+	}
+	$j.ajax({
+		url:'/ext/vpnmgr/runtime/apply_'+pending.requestId+'.json',
+		dataType:'json',cache:false,timeout:10000,
+		error:function(){
+			if(vpnmgr_pendingApply !== pending || !pending.polling) return;
+			setTimeout(function(){PollApplyStatus(pending);},2000);
+		},
+		success:function(data){
+			if(vpnmgr_pendingApply !== pending || !pending.polling) return;
+			if(!data || typeof data != 'object' || data.request !== pending.requestId || typeof data.state != 'string'){
+				SetApplySummary('Received a malformed or stale apply status; checking the same request again.');
+				setTimeout(function(){PollApplyStatus(pending);},2000);
+				return;
+			}
+			if(pending.phase == 'prepare'){
+				if(data.state == 'ready'){
+					pending.polling = false;
+					PostPreparedApply(pending);
+					return;
+				}
+				if(data.state == 'busy' || data.state == 'superseded' || data.state == 'failed'){
+					FinishApplyFailure(pending,'Settings were not submitted: reservation '+data.state+'.');
+					return;
+				}
+			}
+			else if(ApplyResponseValid(data)){
+				RenderApplyStatus(data);
+				if(data.state == 'done' || data.state == 'failed' || data.state == 'superseded'){
+					FinishApplyResult(pending,data);
+					return;
+				}
+			}
+			else{
+				SetApplySummary('Received a malformed apply status; checking the same request again.');
+			}
+			setTimeout(function(){PollApplyStatus(pending);},2000);
+		}
+	});
+}
+
+function ApplyResponseValid(data){
+	if(data.state != 'running' && data.state != 'done' && data.state != 'failed' && data.state != 'superseded') return false;
+	if(typeof data.merged != 'boolean' || !data.clients || data.clients.length != 5) return false;
+	if(['ready','busy','running','expired','nonce_mismatch','unreserved','superseded','snapshot_failed','merge_failed','status_failed','interrupted','complete'].indexOf(data.message) == -1) return false;
+	for(var i=0; i<5; i++){
+		if(data.clients[i].slot != i+1 || ['pending','applying','applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1 || ['not_requested','connected','failed','unknown'].indexOf(data.clients[i].connection) == -1) return false;
+		if(data.state == 'done' && ['applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1) return false;
+	}
+	return true;
+}
+
+function PostPreparedApply(pending){
+	if(vpnmgr_pendingApply !== pending) return;
+	pending.phase = 'apply';
+	SetApplySummary('Settings submitted. Waiting for all client apply results (request '+pending.requestId+').');
+	$j.ajax({
+		url:'/start_apply.htm',method:'POST',type:'POST',data:pending.fields,dataType:'text',cache:false,timeout:20000,
+		error:function(){ BeginApplyPolling(pending,'apply'); },
+		success:function(){ BeginApplyPolling(pending,'apply'); }
+	});
+}
+
+function RenderApplyStatus(data){
+	for(var i=0; i<data.clients.length; i++) SetText('#vpnmgr_client_status_'+(i+1),data.clients[i].status+'; connection '+data.clients[i].connection);
+	if(data.state == 'running') SetApplySummary('Apply in progress for request '+data.request+'.');
+}
+
+function ApplyMessageLabel(code){
+	var messages = {ready:'ready',busy:'another apply is active',running:'running',expired:'reservation expired',nonce_mismatch:'request ID did not match the submitted settings',unreserved:'no reservation exists',superseded:'superseded by a newer request',snapshot_failed:'settings snapshot failed',merge_failed:'settings merge failed',status_failed:'status could not be written',interrupted:'apply was interrupted',complete:'complete'};
+	return messages[code] || 'reported '+code;
+}
+
+function FinishApplyFailure(pending,message){
+	if(vpnmgr_pendingApply !== pending) return;
+	pending.polling = false;
+	RestoreConfigControls(pending);
+	vpnmgr_pendingApply = null;
+	SetApplySummary(message+' You can correct the form and save again.');
+	$j('#btnContinueApply').hide();
+	$j('#btnReloadSettings').hide();
+	CanSaveConfig();
+}
+
+function FinishApplyResult(pending,data){
+	if(vpnmgr_pendingApply !== pending) return;
+	pending.polling = false;
+	RestoreConfigControls(pending);
+	vpnmgr_pendingApply = null;
+	var failed = [];
+	for(var i=0; i<data.clients.length; i++) if(data.clients[i].status == 'failed' || (data.clients[i].status == 'applied' && data.clients[i].connection == 'failed')) failed.push(i+1);
+	var connectionUnknown = false;
+	for(var c=0; c<data.clients.length; c++) if(data.clients[c].status == 'applied' && data.clients[c].connection != 'connected') connectionUnknown = true;
+	if(data.merged && data.state != 'done'){
+		SetApplySummary('Settings saved, but apply ended as '+data.state+' ('+ApplyMessageLabel(data.message)+'). Review the per-client results.');
+	}
+	else if(data.merged && failed.length){
+		SetApplySummary('Settings saved, but apply failed for VPN Client '+failed.join(', ')+'. '+ApplyMessageLabel(data.message)+'.');
+	}
+	else if(data.merged){
+		SetApplySummary(connectionUnknown ? 'Settings saved. Apply completed; review the per-client connection results.' : 'Settings saved. All managed client applies completed successfully.');
+	}
+	else{
+		SetApplySummary('Settings were not merged. '+ApplyMessageLabel(data.message)+'. Correct the form and save again.');
+	}
+	$j('#btnContinueApply').hide();
+	$j('#btnReloadSettings').show();
+	CanSaveConfig();
+	DetectRuntime();
+}
+
+function SetApplySummary(message){ SetText('#vpnmgr_apply_summary',message); }
+
 function initial(){
 	SetCurrentPage();
 	LoadCustomSettings();
 	show_menu();
+	DetectRuntime();
 	GetProviderList();
 	ScriptUpdateLayout();
 }
@@ -566,10 +1004,14 @@ function BuildConfigTable(prefix,title){
 	/* PROVIDER */
 	charthtml+='<tr>';
 	charthtml+='<td class="settingname"><a class="hintstyle" href="javascript:void(0);" onclick="SettingHint(2);">VPN Provider</a></td><td class="settingvalue">';
+	var savedProvider = GetLoadedSetting(prefix+'_provider');
 	for(var pi = 0; pi < vpnmgr_providers.length; pi++){
 		var pid = vpnmgr_providers[pi].id;
 		var pname = vpnmgr_providers[pi].name;
-		charthtml+='<input type="radio" onchange="VPNTypesToggle(this)" name="vpnmgr_'+prefix+'_provider" id="vpnmgr_'+prefix+'_prov_'+pid+'" class="input" value="'+pname+'"'+(pi === 0 ? ' checked' : '')+'><label for="vpnmgr_'+prefix+'_prov_'+pid+'">'+pname+'</label>';
+		charthtml+='<input type="radio" onchange="VPNTypesToggle(this)" name="vpnmgr_'+prefix+'_provider" id="vpnmgr_'+prefix+'_prov_'+pid+'" class="input" value="'+pname+'"'+(pi === 0 && (!savedProvider || IsProviderAvailable(savedProvider)) ? ' checked' : '')+'><label for="vpnmgr_'+prefix+'_prov_'+pid+'">'+pname+'</label>';
+	}
+	if(savedProvider && !IsProviderAvailable(savedProvider)){
+		charthtml+='<input type="radio" onchange="VPNTypesToggle(this)" name="vpnmgr_'+prefix+'_provider" id="vpnmgr_'+prefix+'_prov_unavailable" class="input" value="'+savedProvider.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'" checked><label for="vpnmgr_'+prefix+'_prov_unavailable">Unavailable (saved: '+savedProvider.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+')</label>';
 	}
 	charthtml+='</td>';
 	charthtml+='</tr>';
@@ -681,55 +1123,7 @@ function AddEventHandlers(){
 }
 
 $j.fn.serializeObject = function(){
-	var o = custom_settings;
-	var a = this.serializeArray();
-	$j.each(a,function(){
-		if (o[this.name] !== undefined && this.name.indexOf('vpnmgr') != -1 && this.name.indexOf('version') == -1 && this.name.indexOf('schdays') == -1 && this.name.indexOf('countryid') == -1 && this.name.indexOf('cityid') == -1){
-			if (!o[this.name].push){
-				o[this.name] = [o[this.name]];
-			}
-			o[this.name].push(this.value || '');
-		}
-		else if (this.name.indexOf('vpnmgr') != -1 && this.name.indexOf('version') == -1 && this.name.indexOf('schdays') == -1 && this.name.indexOf('countryid') == -1 && this.name.indexOf('cityid') == -1){
-			o[this.name] = this.value || '';
-		}
-	});
-	for(var i=1; i < 6; i++){
-		var schdays = [];
-		$j.each($j('input[name="vpnmgr_vpn'+i+'_schdays"]:checked'),function(){
-			schdays.push($j(this).val());
-		});
-		var schdaysstring = schdays.join(',');
-		if(schdaysstring == 'Mon,Tues,Wed,Thurs,Fri,Sat,Sun'){
-			schdaysstring = '*';
-		}
-		o['vpnmgr_vpn'+i+'_schdays'] = schdaysstring;
-		
-		var selectedprovider = $j('input[name="vpnmgr_vpn'+i+'_provider"]:checked').val();
-		var selectedpid = selectedprovider ? selectedprovider.toLowerCase() : '';
-		if(selectedpid == 'nordvpn' && $j('select[name="vpnmgr_vpn'+i+'_countryname"]').val() != ''){
-			var nordcountries = providerCountries['nordvpn'] || [];
-			o['vpnmgr_vpn'+i+'_countryid'] = nordcountries.filter(function(item){
-				return item.name == $j('select[name="vpnmgr_vpn'+i+'_countryname"]').val();
-			}).map(function(d){return d.id})[0] || 0;
-			if($j('select[name="vpnmgr_vpn'+i+'_cityname"]').val() == ''){
-				o['vpnmgr_vpn'+i+'_cityid'] = 0;
-			}
-			else{
-				var nordcity = nordcountries.filter(function(item){
-					return item.name == $j('select[name="vpnmgr_vpn'+i+'_countryname"]').val();
-				})[0];
-				o['vpnmgr_vpn'+i+'_cityid'] = nordcity ? nordcity.cities.filter(function(item){
-					return item.name == $j('select[name="vpnmgr_vpn'+i+'_cityname"]').val();
-				}).map(function(d){return d.id})[0] || 0 : 0;
-			}
-		}
-		else{
-			o['vpnmgr_vpn'+i+'_countryid'] = 0;
-			o['vpnmgr_vpn'+i+'_cityid'] = 0;
-		}
-	}
-	return o;
+	return BuildCustomSettingsPayload('');
 };
 
 function ScriptUpdateLayout(){
