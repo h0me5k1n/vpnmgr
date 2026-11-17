@@ -90,6 +90,30 @@ function SetLoadingCopy(main,detail){
 	if(detailElement) detailElement.textContent = detail;
 }
 
+function SetApplyLoadingCopy(detail,pending){
+	pending = pending || vpnmgr_pendingApply;
+	var percent = pending && typeof pending.progressPercent == 'number' ? pending.progressPercent : 0;
+	SetLoadingCopy('Please wait,',percent+'% '+detail);
+}
+
+// Seven equal units represent the merge, five client outcomes, and terminal success.
+function UpdateApplyProgress(pending,data,terminalSuccess){
+	if(!pending || !ApplyRequestIdValid(pending.requestId) || !ApplyResponseValid(data) || data.request !== pending.requestId) return;
+	if(vpnmgr_pendingApply !== pending) return;
+	var completedUnits = pending.progressUnits || 0;
+	if(data.merged){
+		var snapshotUnits = 1;
+		for(var i=0; i<data.clients.length; i++){
+			if(['applied','failed','unmanaged'].indexOf(data.clients[i].status) != -1) snapshotUnits++;
+		}
+		completedUnits = Math.max(completedUnits,Math.min(snapshotUnits,6));
+	}
+	if(terminalSuccess) completedUnits = 7;
+	pending.progressUnits = Math.max(pending.progressUnits || 0,completedUnits);
+	pending.progressPercent = Math.floor(pending.progressUnits*100/7);
+	SetApplyLoadingCopy(pending.loadingDetail || 'Applying settings...',pending);
+}
+
 function RecoveryControls(){
 	var controls = document.getElementById && document.getElementById('vpnmgr_recovery_controls');
 	if(controls){
@@ -170,7 +194,7 @@ function StartApplyOverlay(){
 		// an error leaves this page open. Do not restart or duplicate its loop.
 		if(hadStopFlag) window.stopFlag = savedStopFlag;
 	}
-	SetLoadingCopy('Please wait,','Applying settings...');
+	SetApplyLoadingCopy('Applying settings...');
 	PlaceRecoveryControls();
 	if(!vpnmgr_nativeLoadingActive){
 		var notice = document.getElementById && document.getElementById('vpnmgr_recovery_notice');
@@ -204,7 +228,7 @@ function FinishApplyOverlay(){
 function ShowRecoveryControls(message){
 	var notice = document.getElementById && document.getElementById('vpnmgr_recovery_notice');
 	if(notice) notice.textContent = message;
-	SetLoadingCopy('Please wait,','Choose an action below.');
+	SetApplyLoadingCopy('Choose an action below.');
 	SetRecoveryControlsVisible(true);
 	$j('#btnContinueApply').show();
 	$j('#btnReloadSettings').show();
@@ -919,7 +943,7 @@ function SaveConfig(){
 		var requestId = NewRuntimeRequestId();
 		var payload = BuildCustomSettingsPayload(requestId);
 		var fields = CollectFormFields('start_vpnmgrapply_'+requestId,payload);
-		vpnmgr_pendingApply = {requestId:requestId,payload:payload,fields:fields,phase:'prepare',startedAt:0,polling:false};
+		vpnmgr_pendingApply = {requestId:requestId,payload:payload,fields:fields,phase:'prepare',startedAt:0,polling:false,progressUnits:0,progressPercent:0,loadingDetail:'Applying settings...'};
 		FreezeConfigControls(vpnmgr_pendingApply);
 		SetApplyDiagnostic('Reserving settings apply.');
 		$j('#btnReloadSettings').hide();
@@ -1068,7 +1092,8 @@ function ContinueApplyChecking(){
 		RecoverApplyReservation(pending);
 		return;
 	}
-	SetLoadingCopy('Please wait,','Checking the same request.');
+	pending.loadingDetail = 'Checking the same request.';
+	SetApplyLoadingCopy(pending.loadingDetail,pending);
 	BeginApplyPolling(pending,pending.phase);
 }
 
@@ -1076,7 +1101,8 @@ function RecoverApplyReservation(pending){
 	if(vpnmgr_pendingApply !== pending || pending.polling || pending.recovering) return;
 	pending.recovering = true;
 	SetApplyDiagnostic('Checking the same request reservation.');
-	SetLoadingCopy('Please wait,','The same request is being checked.');
+	pending.loadingDetail = 'The same request is being checked.';
+	SetApplyLoadingCopy(pending.loadingDetail,pending);
 	LogApplyNotice(pending,'recovery_started');
 	var fields = $j(document.formScriptActions).serializeArray();
 	for(var i=0; i<fields.length; i++) if(fields[i].name == 'action_script') fields[i].value = 'start_vpnmgrrecover_'+pending.requestId;
@@ -1149,6 +1175,7 @@ function PollApplyStatus(pending){
 			}
 			else if(ApplyResponseValid(data)){
 				LogApplyStatus(pending,'status',data);
+				UpdateApplyProgress(pending,data);
 				if(data.state == 'done' || data.state == 'failed' || data.state == 'superseded'){
 					FinishApplyResult(pending,data);
 					return;
@@ -1181,7 +1208,8 @@ function PostPreparedApply(pending){
 	if(vpnmgr_pendingApply !== pending) return;
 	pending.phase = 'apply';
 	SetApplyDiagnostic('Settings payload submitted; waiting for authoritative apply status.');
-	SetLoadingCopy('Please wait,','Applying settings...');
+	pending.loadingDetail = 'Applying settings...';
+	SetApplyLoadingCopy(pending.loadingDetail,pending);
 	$j.ajax({
 		url:'/start_apply.htm',method:'POST',type:'POST',data:pending.fields,dataType:'text',cache:false,timeout:20000,
 		error:function(){ LogApplyNotice(pending,'payload_post_error'); BeginApplyPolling(pending,'apply'); },
@@ -1213,10 +1241,10 @@ function FinishApplyFailure(pending,message,event){
 }
 
 function FinishApplyResult(pending,data){
-	if(vpnmgr_pendingApply !== pending) return;
+	if(vpnmgr_pendingApply !== pending || pending.finishing) return;
+	pending.finishing = true;
+	UpdateApplyProgress(pending,data);
 	pending.polling = false;
-	RestoreConfigControls(pending);
-	vpnmgr_pendingApply = null;
 	var failed = [];
 	var uncertain = [];
 	for(var i=0; i<data.clients.length; i++){
@@ -1245,14 +1273,32 @@ function FinishApplyResult(pending,data){
 		alertMessage = 'Settings were not saved because '+ApplyMessageLabel(data.message)+'. Review the settings and try again.';
 	}
 	if(terminalFailure) SetApplyDiagnostic(alertMessage);
-	FinishApplyOverlay();
-	LogApplyStatus(pending,terminalFailure ? 'terminal_failure' : 'terminal_success',data);
-	CanSaveConfig();
 	if(terminalFailure){
+		RestoreConfigControls(pending);
+		vpnmgr_pendingApply = null;
+		FinishApplyOverlay();
+		LogApplyStatus(pending,'terminal_failure',data);
+		CanSaveConfig();
 		DetectRuntime();
 		alert(alertMessage);
 	}
-	else reload();
+	else{
+		pending.loadingDetail = 'Applying Settings';
+		UpdateApplyProgress(pending,data,true);
+		setTimeout(function(){
+			if(vpnmgr_pendingApply !== pending || !pending.finishing) return;
+			SetLoadingCopy('Complete','');
+			setTimeout(function(){
+				if(vpnmgr_pendingApply !== pending || !pending.finishing) return;
+				RestoreConfigControls(pending);
+				vpnmgr_pendingApply = null;
+				FinishApplyOverlay();
+				LogApplyStatus(pending,'terminal_success',data);
+				CanSaveConfig();
+				reload();
+			},500);
+		},500);
+	}
 }
 
 function initial(){

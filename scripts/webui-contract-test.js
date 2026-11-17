@@ -367,11 +367,102 @@ function testStatusCorrelationAndLateCompletion(){
 			options.success({request:requestId,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
 		}
 	};
+	context.StartApplyOverlay();
 	context.ContinueApplyChecking();
+	context.queuedTimer();
+	assert.strictEqual(context.vpnmgr_pendingApply,pending,'confirmed success remains pending during its display dwell');
+	assert.strictEqual(pending.progressPercent,100,'confirmed success reaches 100 percent before cleanup');
+	assert.strictEqual(loadingState.visible,true,'success overlay remains visible during its display dwell');
+	assert.strictEqual(context.queuedDelay,500,'confirmed success uses the fixed display dwell');
+	context.queuedTimer();
+	assert.strictEqual(proceedingMain.textContent,'Complete','the native main line shows Complete after the 100 percent dwell');
+	assert.strictEqual(proceedingDetail.textContent,'','the native detail line clears during Complete');
+	assert.strictEqual(context.vpnmgr_pendingApply,pending,'the request remains active during the Complete dwell');
+	assert.strictEqual(loadingState.visible,true,'the overlay remains visible during the Complete dwell');
+	assert.strictEqual(context.queuedDelay,500,'Complete remains visible for its own 500 ms dwell');
 	context.queuedTimer();
 	assert.strictEqual(context.vpnmgr_pendingApply,null,'late completion should finish the original request');
 	assert.strictEqual(calls.filter(function(call){return call.url == '/start_apply.htm' && call.data.filter(function(field){return field.name == 'action_script';})[0].value.indexOf('start_vpnmgrapply_') == 0;}).length,0);
 	assert.ok(context.vpnmgr_lastApplyDiagnostic.indexOf('Settings saved') != -1);
+}
+
+function testBackendProgressRequiresMatchingResolvedOutcomes(){
+	var pending = {requestId:'2323232323232323232',phase:'apply',polling:true,startedAt:new Date().getTime(),progressUnits:0,progressPercent:0};
+	context.vpnmgr_pendingApply = pending;
+	context.StartApplyOverlay();
+	assert.ok(proceedingDetail.textContent.indexOf('0%') != -1,'new apply starts at zero');
+	var response;
+	jqueryState.ajax = function(options){ options.success(response); };
+	function poll(data){ response = data; context.PollApplyStatus(pending); }
+	poll(applyResponse(pending.requestId,'running',false,['applied','applied','applied','applied','applied']));
+	assert.strictEqual(pending.progressPercent,0,'client outcomes before settings merge do not advance progress');
+	var first = applyResponse(pending.requestId,'running',true,['pending','pending','pending','pending','pending']);
+	poll(first);
+	assert.strictEqual(pending.progressPercent,14,'merged settings complete the first of seven units');
+	assert.ok(proceedingDetail.textContent.indexOf('14%') != -1);
+	var second = applyResponse(pending.requestId,'running',true,['applied','pending','pending','pending','pending']);
+	poll(second);
+	assert.strictEqual(pending.progressPercent,28,'one resolved client advances one unit');
+	var third = applyResponse(pending.requestId,'running',true,['applied','failed','pending','pending','pending']);
+	poll(third);
+	assert.strictEqual(pending.progressPercent,42,'failed client outcome still completes its attempt');
+	poll(applyResponse('different-request','running',true,['applied','applied','applied','applied','applied']));
+	assert.strictEqual(pending.progressPercent,42,'stale response cannot advance progress');
+	var malformed = applyResponse(pending.requestId,'running',true,['applied','applied','applied','applied','applied']);
+	malformed.clients.pop();
+	poll(malformed);
+	assert.strictEqual(pending.progressPercent,42,'malformed response cannot advance progress');
+	var regressed = applyResponse(pending.requestId,'running',true,['pending','pending','pending','pending','pending']);
+	poll(regressed);
+	assert.strictEqual(pending.progressPercent,42,'older matching snapshots cannot regress per-request progress');
+	var unmerged = applyResponse(pending.requestId,'running',false,['applied','applied','applied','applied','applied']);
+	poll(unmerged);
+	assert.strictEqual(pending.progressPercent,42,'client outcomes do not count before settings merge');
+	var allResolvedRunning = applyResponse(pending.requestId,'running',true,['applied','failed','unmanaged','applied','applied']);
+	poll(allResolvedRunning);
+	assert.strictEqual(pending.progressPercent,85,'all resolved attempts remain below terminal success while running');
+	assert.ok(proceedingDetail.textContent.indexOf('85%') != -1);
+	pending.startedAt = 0;
+	context.PollApplyStatus(pending);
+	assert.strictEqual(pending.progressPercent,85,'elapsed timeout does not change backend progress');
+	assert.ok(proceedingDetail.textContent.indexOf('85%') != -1,'timeout recovery keeps the last percentage visible');
+	context.ContinueApplyChecking();
+	assert.ok(proceedingDetail.textContent.indexOf('85%') != -1,'same-request recovery preserves the percentage');
+	context.FinishApplyFailure(pending,'Progress test cleanup.');
+
+	var partial = {requestId:'2424242424242424242',phase:'apply',polling:true,progressUnits:0,progressPercent:0};
+	context.vpnmgr_pendingApply = partial;
+	context.StartApplyOverlay();
+	var failedResult = applyResponse(partial.requestId,'done',true,['applied','failed','unmanaged','applied','applied']);
+	failedResult.clients[1].connection = 'failed';
+	context.FinishApplyResult(partial,failedResult);
+	assert.strictEqual(partial.progressPercent,85,'partial terminal result never reaches 100 percent');
+
+	var uncertain = {requestId:'2626262626262626262',phase:'apply',polling:true,progressUnits:0,progressPercent:0};
+	context.vpnmgr_pendingApply = uncertain;
+	context.StartApplyOverlay();
+	var uncertainResult = applyResponse(uncertain.requestId,'done',true);
+	uncertainResult.clients[0].connection = 'unknown';
+	context.FinishApplyResult(uncertain,uncertainResult);
+	assert.strictEqual(uncertain.progressPercent,85,'uncertain connection outcome never reaches 100 percent');
+	assert.strictEqual(context.vpnmgr_pendingApply,null,'uncertain result is released immediately without the success dwell');
+	assert.strictEqual(loadingState.visible,false,'uncertain result closes the overlay immediately');
+	assert.notStrictEqual(proceedingMain.textContent,'Complete','uncertain result never shows Complete');
+
+	var success = {requestId:'2525252525252525252',phase:'apply',polling:true,progressUnits:0,progressPercent:0};
+	context.vpnmgr_pendingApply = success;
+	context.StartApplyOverlay();
+	var successfulResult = applyResponse(success.requestId,'done',true,['applied','unmanaged','applied','applied','applied']);
+	successfulResult.clients[0].connection = 'verified_stopped';
+	context.FinishApplyResult(success,successfulResult);
+	assert.strictEqual(success.progressPercent,100,'verified_stopped is an authoritative successful terminal outcome');
+	assert.strictEqual(context.vpnmgr_pendingApply,success,'successful request remains active until the display timer fires');
+	assert.strictEqual(proceedingDetail.textContent,'100% Applying Settings','verified success displays completion copy at 100 percent');
+	context.queuedTimer();
+	assert.strictEqual(proceedingMain.textContent,'Complete','success transitions to Complete after 500 ms');
+	assert.strictEqual(context.vpnmgr_pendingApply,success,'request remains pending through the Complete dwell');
+	context.queuedTimer();
+	assert.strictEqual(context.vpnmgr_pendingApply,null,'success cleanup runs after the display timer');
 }
 
 function testPrepareGateAndNoncePost(){
@@ -544,6 +635,12 @@ function testRecoveryLossAndLateApplyAreUncertainSafe(){
 			statusState = 'done';
 			context.queuedTimer();
 		}
+		assert.strictEqual(context.vpnmgr_pendingApply,current.pending,'confirmed completion stays active during its display dwell');
+		assert.strictEqual(current.field.disabled,true,'the form stays locked during the success dwell');
+		context.queuedTimer();
+		assert.strictEqual(proceedingMain.textContent,'Complete','late confirmed apply shows Complete in the native overlay');
+		assert.strictEqual(context.vpnmgr_pendingApply,current.pending,'the request stays active during Complete');
+		context.queuedTimer();
 		assert.strictEqual(context.vpnmgr_pendingApply,null,'late applied delivery is accepted as authoritative completion');
 		assert.strictEqual(current.field.disabled,false);
 		assert.strictEqual(applyCount,0,'recovery and late polling never repost settings');
@@ -584,6 +681,12 @@ function testVerifiedStoppedConnectionStatus(){
 	context.lastAlert = undefined;
 	context.FinishApplyResult(pending,data);
 	assert.strictEqual(context.lastAlert,undefined,'verified stopped is a successful outcome');
+	assert.strictEqual(context.vpnmgr_pendingApply,pending,'verified stopped remains active until the display dwell ends');
+	context.queuedTimer();
+	assert.strictEqual(proceedingMain.textContent,'Complete','verified stopped displays the native Complete phase');
+	assert.strictEqual(context.vpnmgr_pendingApply,pending,'verified stopped remains active through Complete');
+	context.queuedTimer();
+	assert.strictEqual(context.vpnmgr_pendingApply,null,'verified stopped cleanup follows the display dwell');
 	assert.ok(JSON.stringify(consoleSnapshots).indexOf('verified_stopped') != -1,'console reports the truthful verified-stopped state');
 	assert.strictEqual(JSON.stringify(consoleSnapshots).indexOf('currently connected'),-1);
 }
@@ -620,8 +723,11 @@ function testNativeOverlayCleanup(){
 	};
 	var initialHideCount = loadingState.hideCalls;
 	var initialReloadCount = context.reloadCount || 0;
+	formElements.length = 0;
+	var successField = addElement('vpnmgr_vpn1_pwd','locked-value','password',false,false);
 	var success = {requestId:'1818181818181818181',phase:'apply',polling:true};
 	context.vpnmgr_pendingApply = success;
+	context.FreezeConfigControls(success);
 	context.lastAlert = undefined;
 	htmlNode.style.overflow = 'scroll';
 	context.StartApplyOverlay();
@@ -631,13 +737,37 @@ function testNativeOverlayCleanup(){
 	assert.ok(context.vpnmgr_recoveryRow && context.vpnmgr_recoveryRow.parentNode === loadingTable,'recovery controls are placed in a native loadingBlock table row');
 	var done = applyResponse(success.requestId,'done',true,['unmanaged','unmanaged','unmanaged','unmanaged','unmanaged']);
 	context.FinishApplyResult(success,done);
-	assert.strictEqual(loadingState.visible,false,'successful completion hides the native overlay');
+	var percentCallback = context.queuedTimer;
+	context.FinishApplyResult(success,done);
+	assert.strictEqual(context.queuedTimer,percentCallback,'duplicate terminal handling cannot schedule a second dwell');
+	assert.strictEqual(success.progressPercent,100,'confirmed success fills the percentage bar before reload');
+	assert.strictEqual(proceedingDetail.textContent,'100% Applying Settings','success text remains visible during the dwell');
+	assert.strictEqual(context.vpnmgr_pendingApply,success,'the same request remains active during the dwell');
+	assert.strictEqual(successField.disabled,true,'configuration remains locked during the dwell');
+	assert.strictEqual(loadingState.visible,true,'successful completion keeps the native overlay visible');
+	assert.strictEqual(context.queuedDelay,500,'100 percent is scheduled for a 500 ms dwell');
+	assert.strictEqual(context.reloadCount || 0,initialReloadCount,'success does not reload before the scheduled callback');
+	percentCallback();
+	assert.strictEqual(proceedingMain.textContent,'Complete','the main native line changes to Complete');
+	assert.strictEqual(proceedingDetail.textContent,'','Complete clears the detail native line');
+	assert.strictEqual(context.vpnmgr_pendingApply,success,'the same request remains active during Complete');
+	assert.strictEqual(successField.disabled,true,'configuration remains locked during Complete');
+	assert.strictEqual(loadingState.visible,true,'the native overlay remains visible during Complete');
+	assert.strictEqual(context.queuedDelay,500,'Complete is scheduled for a second 500 ms dwell');
+	assert.strictEqual(context.reloadCount || 0,initialReloadCount,'navigation waits through both display phases');
+	var completeCallback = context.queuedTimer;
+	context.FinishApplyResult(success,done);
+	assert.strictEqual(context.queuedTimer,completeCallback,'duplicate terminal handling cannot restart the Complete dwell');
+	completeCallback();
+	assert.strictEqual(loadingState.visible,false,'the delayed cleanup hides the native overlay');
 	assert.strictEqual(loadingState.hideCalls,initialHideCount+1);
-	assert.strictEqual(htmlNode.style.overflow,'scroll','original page scrolling is restored');
+	assert.strictEqual(htmlNode.style.overflow,'scroll','original page scrolling is restored after the dwell');
 	assert.deepStrictEqual(context.lastScroll,[17,29]);
-	assert.strictEqual(recoveryControls.parentNode,recoveryHome,'static recovery controls return to their home after completion');
+	assert.strictEqual(recoveryControls.parentNode,recoveryHome,'static recovery controls return home after completion');
+	assert.strictEqual(context.vpnmgr_pendingApply,null,'the request clears after delayed cleanup');
+	assert.strictEqual(successField.disabled,false,'the form unlocks after delayed cleanup');
 	assert.strictEqual(context.lastAlert,undefined,'success is silent');
-	assert.strictEqual(context.reloadCount,initialReloadCount+1,'confirmed success reloads the page');
+	assert.strictEqual(context.reloadCount,initialReloadCount+1,'confirmed success reloads once after the dwell');
 
 	var failure = {requestId:'1919191919191919191',phase:'apply',polling:true};
 	context.vpnmgr_pendingApply = failure;
@@ -646,6 +776,7 @@ function testNativeOverlayCleanup(){
 	failed.clients[1].connection = 'failed';
 	context.FinishApplyResult(failure,failed);
 	assert.strictEqual(loadingState.visible,false,'terminal failure hides the native overlay');
+	assert.notStrictEqual(proceedingMain.textContent,'Complete','partial failure never displays Complete');
 	assert.ok(context.lastAlert.indexOf('VPN Client 2') != -1,'terminal failure gives a concise user alert');
 	assert.strictEqual(recoveryControls.parentNode,recoveryHome);
 	assert.strictEqual(context.reloadCount,initialReloadCount+1,'partial failure preserves the page and edits');
@@ -659,6 +790,42 @@ function testNativeOverlayCleanup(){
 	context.FinishApplyFailure(missingHide,'Missing hide helper.');
 	context.hideLoading = originalHideLoading;
 	assert.strictEqual(loadingMask.style.visibility,'hidden','fallback cleanup closes the mask if hideLoading is missing');
+}
+
+function testDeferredSuccessCannotFinishNewerRequest(){
+	var oldRequest = {requestId:'2727272727272727272',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = oldRequest;
+	context.StartApplyOverlay();
+	var success = applyResponse(oldRequest.requestId,'done',true,['unmanaged','unmanaged','unmanaged','unmanaged','unmanaged']);
+	context.FinishApplyResult(oldRequest,success);
+	var obsoleteCallback = context.queuedTimer;
+	var reloads = context.reloadCount || 0;
+	var newerRequest = {requestId:'2828282828282828282',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = newerRequest;
+	obsoleteCallback();
+	assert.strictEqual(context.vpnmgr_pendingApply,newerRequest,'obsolete success callback cannot clear a newer request');
+	assert.strictEqual(loadingState.visible,true,'obsolete success callback cannot hide the newer request overlay');
+	assert.notStrictEqual(proceedingMain.textContent,'Complete','obsolete 100 percent callback cannot advance to Complete');
+	assert.strictEqual(context.reloadCount || 0,reloads,'obsolete success callback cannot reload over a newer request');
+	context.FinishApplyFailure(newerRequest,'Guard test cleanup.');
+
+	var completingRequest = {requestId:'2929292929292929292',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = completingRequest;
+	context.StartApplyOverlay();
+	context.FinishApplyResult(completingRequest,applyResponse(completingRequest.requestId,'done',true,['unmanaged','unmanaged','unmanaged','unmanaged','unmanaged']));
+	context.queuedTimer();
+	assert.strictEqual(proceedingMain.textContent,'Complete','the first valid timer advances to the Complete phase');
+	assert.strictEqual(context.vpnmgr_pendingApply,completingRequest);
+	var obsoleteCompleteCallback = context.queuedTimer;
+	var newestRequest = {requestId:'3030303030303030303',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = newestRequest;
+	var beforeCompleteReloads = context.reloadCount || 0;
+	obsoleteCompleteCallback();
+	assert.strictEqual(context.vpnmgr_pendingApply,newestRequest,'obsolete Complete callback cannot clear a newer request');
+	assert.strictEqual(loadingState.visible,true,'obsolete Complete callback cannot hide the newer request overlay');
+	assert.strictEqual(proceedingMain.textContent,'Complete','obsolete Complete callback cannot alter the current display');
+	assert.strictEqual(context.reloadCount || 0,beforeCompleteReloads,'obsolete Complete callback cannot reload over a newer request');
+	context.FinishApplyFailure(newestRequest,'Complete guard test cleanup.');
 }
 
 function testNativeStatusPollingPreserved(){
@@ -757,6 +924,7 @@ testRuntimeInitialDelayHonorsOriginalDeadline();
 testStaleRuntimeResponseIgnored();
 testFreshPayloadAndAllSlots();
 testStatusCorrelationAndLateCompletion();
+testBackendProgressRequiresMatchingResolvedOutcomes();
 testPrepareGateAndNoncePost();
 testRecoveryAfterLostSettingsPost();
 testRecoveryLossAndLateApplyAreUncertainSafe();
@@ -764,6 +932,7 @@ testPartialApplyResult();
 testVerifiedStoppedConnectionStatus();
 testMalformedClientKeepsPollingReachable();
 testNativeOverlayCleanup();
+testDeferredSuccessCannotFinishNewerRequest();
 testNativeStatusPollingPreserved();
 testAllowlistedConsoleSnapshotsAndDedupe();
 testApplyInitialReadAndPendingNotice();

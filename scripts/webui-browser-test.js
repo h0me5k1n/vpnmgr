@@ -52,7 +52,7 @@ function fixture(version = '2.6.12') {
   for (let i = 1; i <= 5; i++) {
     Object.assign(config, Object.fromEntries(Object.entries({managed:i <= 3 ? 'true':'false',provider:'NordVPN',customsettings:'true',protocol:i === 2 ? 'TCP':'UDP',type:'Standard',countryname:'Australia',countryid:'13',cityname:'Sydney',cityid:'100',schenabled:'false',schhours:'*',schmins:'0',schdays:'*'}).map(([k,v]) => ['vpn'+i+'_'+k,v])));
   }
-  return {version, family:version === '2.5.9' ? 'legacy':'modern',config,providers:'nordvpn|NordVPN\npia|PIA\n',records:new Map(),posts:[],detectionReads:[],applyReads:[],recoveries:[],redirects:0,delayDetection:false,busy:false,failSlot:0,stoppedSlot:0,hold:false,wrongStatus:false,loseSettingsPost:false,recoveryLoss:false,recoveryAgeMs:0,runningApply:false,completeRunning:false,configFailure:false,custom:{vpnmgr_version_local:'fixture',vpnmgr_version_server:'fixture',vpnmgr_version_source:'fixture@1234567',unrelated_setting:'preserve=\\value'},creds:{}};
+  return {version, family:version === '2.5.9' ? 'legacy':'modern',config,providers:'nordvpn|NordVPN\npia|PIA\n',records:new Map(),posts:[],detectionReads:[],applyReads:[],recoveries:[],progressSnapshots:[],successVisiblePhases:[],redirects:0,delayDetection:false,busy:false,failSlot:0,stoppedSlot:0,hold:false,wrongStatus:false,loseSettingsPost:false,recoveryLoss:false,recoveryAgeMs:0,runningApply:false,completeRunning:false,configFailure:false,custom:{vpnmgr_version_local:'fixture',vpnmgr_version_server:'fixture',vpnmgr_version_source:'fixture@1234567',unrelated_setting:'preserve=\\value'},creds:{}};
 }
 
 function clients() {
@@ -85,6 +85,12 @@ const server = http.createServer(async (req,res) => {
     if (pathname === '/ext/vpnmgr/pia_countrydata.htm') return respond(res,200,'AU_Sydney\nUK_London\n');
     if (pathname === '/ext/vpnmgr/config.htm') return respond(res,state.configFailure ? 503:200,Object.entries(state.config).map(([k,v]) => k+'='+v).join('\n'));
     if (pathname === '/unexpected-redirect') { state.redirects++; return respond(res,500,'Firmware response executed'); }
+    if (pathname === '/fixture/success-visible') {
+      let text = '';
+      for await (const part of req) text += part;
+      state.successVisiblePhases.push({...JSON.parse(text),pageLoads:state.pageLoads});
+      return respond(res,200,'captured');
+    }
     if (pathname === '/start_apply.htm') {
       let body = '';
       for await (const part of req) body += part;
@@ -140,6 +146,9 @@ const server = http.createServer(async (req,res) => {
         result = {request:result.request,state:'done',merged:true,clients:clients(),message:'complete'};
         state.records.set(name,result);
         state.completeRunning = false;
+      }
+      if (result && name.startsWith('apply_') && result.state === 'running' && state.progressSnapshots.length) {
+        result = {...state.progressSnapshots.shift(),request:result.request};
       }
       if (!result || result.misses-- > 0 || (name.startsWith('apply_') && state.hold && result.state === 'done')) return respond(res,404,'Not ready');
       return respond(res,200,JSON.stringify(state.wrongStatus && result.state === 'done' && name.startsWith('apply_') ? {...result,request:'999'}:result),'application/json');
@@ -239,13 +248,14 @@ async function save() {
 	const pageLoadsBefore = state.pageLoads;
   // Observe the synchronous click before a fast fixture can finish its AJAX
   // round trips. No artificial production delay is needed to see the overlay.
-  const started = await execute('document.querySelector("#btnSaveConfig").click();return {active:window.vpnmgr_applyOverlayActive,visible:document.querySelector("#Loading").style.visibility === "visible",untimed:window.fixtureShowLoadingArgs.length ? window.fixtureShowLoadingArgs[window.fixtureShowLoadingArgs.length-1] === 0 : document.querySelector("#proceeding_main_txt").textContent.indexOf("Please wait") !== -1,controls:document.querySelector("#loadingBlock").contains(document.querySelector("#vpnmgr_recovery_controls")),text:document.querySelector("#Loading").innerText,exposesCodes:/(verified_stopped|merged|unmanaged|pending|applied)/.test(document.body.innerText)};');
+  const started = await execute('document.querySelector("#btnSaveConfig").click();return {active:window.vpnmgr_applyOverlayActive,visible:document.querySelector("#Loading").style.visibility === "visible",untimed:window.fixtureShowLoadingArgs.length ? window.fixtureShowLoadingArgs[window.fixtureShowLoadingArgs.length-1] === 0 : document.querySelector("#proceeding_main_txt").textContent.indexOf("Please wait") !== -1,controls:document.querySelector("#loadingBlock").contains(document.querySelector("#vpnmgr_recovery_controls")),text:document.querySelector("#Loading").innerText,initialProgress:document.querySelector("#proceeding_txt").textContent,exposesCodes:/(verified_stopped|merged|unmanaged|pending|applied)/.test(document.body.innerText)};');
   assert.equal(started.active,true,'native loading overlay starts');
   assert.equal(await execute('return window.stopFlag'),0,'native overlay preserves firmware status/autologout polling');
   assert.equal(started.visible,true,'apply uses the visible full-screen mask');
   assert.equal(started.untimed,true,'native loading helper is called without a countdown');
   assert.equal(started.controls,true,'recovery controls live in a native loadingBlock table');
   assert.match(started.text,/Please wait|Applying settings/);
+  assert.match(started.initialProgress,/0%/,'a new save starts at zero percent');
   assert.equal(started.exposesCodes,false,'the overlay does not expose backend status codes');
   await until('!window.vpnmgr_pendingApply && (!document.querySelector("#btnSaveConfig") || !document.querySelector("#btnSaveConfig").disabled)','apply terminal');
   if(!state.busy && !state.failSlot) {
@@ -299,6 +309,45 @@ async function runRuntimeJourney() {
   assert.equal(await execute('return document.querySelector("#vpnmgr_runtime_status").textContent.indexOf("OpenVPN 2.6.12") !== -1'),true);
 }
 
+async function runRunningApplyProgressJourney() {
+  state = fixture();
+  state.runningApply = true;
+  state.progressSnapshots = [
+    {state:'running',merged:true,clients:Array.from({length:5},(_,index)=>({slot:index+1,status:'pending',connection:'unknown'})),message:'running'},
+    {state:'running',merged:true,clients:Array.from({length:5},(_,index)=>({slot:index+1,status:index === 0 ? 'applied':'pending',connection:index === 0 ? 'connected':'unknown'})),message:'running'}
+  ];
+  await load();
+  await click('#btnSaveConfig');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply" && Object.keys(vpnmgr_lastApplyLog[vpnmgr_pendingApply.requestId] || {}).some(function(item){return item.indexOf("\\"state\\":\\"running\\"") !== -1;})','running apply');
+  await until('document.querySelector("#proceeding_txt").textContent.indexOf("14%") === 0','merged settings progress');
+  await until('document.querySelector("#proceeding_txt").textContent.indexOf("28%") === 0','first resolved client progress');
+  assert.equal(await execute('return document.querySelector("#proceeding_txt").textContent'), '28% Applying settings...','matching backend snapshots visibly advance the native overlay');
+  const runningId = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_([0-9]+)$/)[1];
+  await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
+  await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','running apply timeout');
+  assert.equal(await execute('return document.querySelector("#proceeding_txt").textContent'), '28% Choose an action below.','timeout preserves the last backend percentage');
+  await clickVisible('#btnContinueApply');
+  await untilHost(() => state.recoveries.length === 1,'running apply recovery request');
+  assert.equal(state.recoveries[0].state,'running','recovery must leave running work unchanged');
+  await until('document.querySelector("#proceeding_txt").textContent.indexOf("The same request is being checked.") !== -1','recovery progress message');
+  assert.equal(await execute('return document.querySelector("#proceeding_txt").textContent'), '28% The same request is being checked.','same-request recovery preserves the percentage');
+  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,1,'recovery must not repost the payload');
+  const pageLoadsBeforeRunningFinish = state.pageLoads;
+  await execute('var overlay=document.querySelector("#loadingBlock"),detail=document.querySelector("#proceeding_txt"),main=document.querySelector("#proceeding_main_txt"),seen={};window.fixtureSuccessObserver=new MutationObserver(function(){if(document.querySelector("#Loading").style.visibility !== "visible")return;var phase=detail.textContent === "100% Applying Settings" ? "percentage":main.textContent === "Complete" && detail.textContent === "" ? "complete":"";if(phase && !seen[phase]){seen[phase]=true;fetch("/fixture/success-visible",{method:"POST",body:JSON.stringify({phase,main:main.textContent,detail:detail.textContent})});if(seen.percentage && seen.complete)window.fixtureSuccessObserver.disconnect();}});window.fixtureSuccessObserver.observe(overlay,{childList:true,characterData:true,subtree:true});');
+  state.completeRunning = true;
+  await untilHost(() => state.successVisiblePhases.length === 2,'100 percent and Complete captured before navigation');
+  assert.deepEqual(state.successVisiblePhases.map(item => item.phase),['percentage','complete'],'the native overlay displays both success phases in order');
+  assert.equal(state.successVisiblePhases[0].detail,'100% Applying Settings','100 percent completion is visible');
+  assert.equal(state.successVisiblePhases[1].main,'Complete','the native popup main line shows Complete');
+  assert.equal(state.successVisiblePhases[1].detail,'','Complete clears the native popup detail line');
+  assert.ok(state.successVisiblePhases.every(item => item.pageLoads === pageLoadsBeforeRunningFinish),'both success phases are captured before the page reload');
+  await until('!window.vpnmgr_pendingApply && (!document.querySelector("#btnSaveConfig") || !document.querySelector("#btnSaveConfig").disabled)','running apply completes');
+  await untilHost(() => state.pageLoads === pageLoadsBeforeRunningFinish+1,'running apply success reloads saved settings');
+  await until('window.vpnmgr_initComplete && document.querySelector("#btnSaveConfig") && !document.querySelector("#btnSaveConfig").disabled','running apply reload ready');
+  assert.equal(state.records.get('apply_'+runningId+'.json').state,'done');
+  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,1);
+}
+
 async function run() {
   state = fixture();
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
@@ -350,6 +399,7 @@ async function run() {
     const reads = state.applyReads.filter(read => read.name === 'apply_'+id+'.json');
     assert.ok(reads[0].at-prepared.at >= 1800,'reservation read waits for asynchronous backend publication');
     assert.ok(reads.find(read => read.at > applied.at).at-applied.at >= 1800,'apply read waits for asynchronous backend publication');
+    await runRunningApplyProgressJourney();
     state = fixture();state.loseSettingsPost = true;state.recoveryAgeMs = 61000;
     await load();await clickVisible('#btnSaveConfig');
     await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply" && vpnmgr_lastApplyDiagnostic.indexOf("remains reserved") !== -1','ready result after lost settings POST');
@@ -361,7 +411,7 @@ async function run() {
     assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,1,'lost settings are never reposted');
     assert.equal(state.pageLoads,1,'failed apply retains edits without an automatic reload');
     assert.equal(await execute('return document.querySelector("#Loading").style.visibility === "visible"'),false,'recovery closes the native mask');
-    console.log('Apply-only '+(firefox ? 'Firefox Developer':'Chrome')+' journeys passed: delayed reservation/apply reads, native overlay, success reload, informational pending status, lost POST and same-request recovery without resubmission.');
+    console.log('Apply-only '+(firefox ? 'Firefox Developer':'Chrome')+' journeys passed: delayed reservation/apply reads, visible backend progress and recovery retention, success reload, informational pending status, lost POST and same-request recovery without resubmission.');
     console.log('One isolated browser session; '+((Date.now()-started)/1000).toFixed(2)+'s wall. Firmware endpoints simulated; no router contacted.');
     return;
   }
@@ -505,24 +555,7 @@ async function run() {
   assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),true,'uncertain recovery keeps config frozen');
   assert.equal(await execute('return document.querySelector("#btnReloadSettings").style.display !== "none"'),true,'reload remains an explicit escape');
 
-  state = fixture();
-  state.runningApply = true;
-  await load();
-  await click('#btnSaveConfig');
-  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply" && Object.keys(vpnmgr_lastApplyLog[vpnmgr_pendingApply.requestId] || {}).some(function(item){return item.indexOf("\\"state\\":\\"running\\"") !== -1;})','running apply');
-  const runningId = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_(\d+)$/)[1];
-  await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
-  await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','running apply timeout');
-  await clickVisible('#btnContinueApply');
-  await untilHost(() => state.recoveries.length === 1,'running apply recovery request');
-  assert.equal(state.recoveries[0].state,'running','recovery must leave running work unchanged');
-  state.completeRunning = true;
-  const pageLoadsBeforeRunningFinish = state.pageLoads;
-  await until('!window.vpnmgr_pendingApply && (!document.querySelector("#btnSaveConfig") || !document.querySelector("#btnSaveConfig").disabled)','running apply completes');
-  await untilHost(() => state.pageLoads === pageLoadsBeforeRunningFinish+1,'running apply success reloads saved settings');
-  await until('window.vpnmgr_initComplete && document.querySelector("#btnSaveConfig") && !document.querySelector("#btnSaveConfig").disabled','running apply reload ready');
-  assert.equal(state.records.get('apply_'+runningId+'.json').state,'done');
-  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,1);
+  await runRunningApplyProgressJourney();
 
   state = fixture();
   state.config.vpn1_cityname = 'Melbourne';
