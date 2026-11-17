@@ -21,6 +21,8 @@ empty "## Unreleased" heading; the smoke test rejects one.
 
 ### Fixed
 
+- Recover a lost WebUI settings POST by expiring only its unused reservation, preserving edits and late/running request correlation without resubmitting settings. Report clients restored to stopped accurately and retain unavailable location IDs only for unchanged selections.
+- Make normal direct installs verify/refetch their own pinned main script before installing dependencies, with automatic NordVPN visibility in pinned test builds. Preserve ordinary `unknown` branch-fallback reentry and the existing `develop`/`stable` switching paths.
 - Preflight NordVPN CA and control-channel key material before updating active client state. Handle legacy `tls-auth` and modern `tls-crypt`, normalize CRLF profiles and preserve existing certificate verification.
 - Refresh scripts, providers and WebUI assets from one selected revision, including same-version builds. Preserve revision metadata across update re-execution and distinguish completed asset refreshes from installed source provenance.
 - Reject incomplete WebUI settings, preserve unavailable configured providers and rebuild a fresh scalar payload for each Save.

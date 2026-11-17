@@ -49,6 +49,8 @@ end-to-end with a live account on a real router.**
 **Install convention:** `Install_Providers` has an explicit bundled-module list; normal WebUI
 visibility still requires `ACTIVE`. `VPNMGR_TEST_PROVIDERS=nordvpn` persists a narrow development
 opt-in exposing NordVPN at `UNTESTED`/`API_TESTED` without promoting its status. Empty removes it.
+Pinned builds with `SCRIPT_BRANCH_OVERRIDE` set default to that NordVPN opt-in, so the normal
+direct install needs no extra environment variables. Explicit developer choices still win.
 Keep module installation, WebUI visibility and actual support status distinct.
 
 ## API check

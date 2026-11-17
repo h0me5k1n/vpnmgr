@@ -14,8 +14,8 @@ ROOT="$(CDPATH='' cd "$(dirname "$0")/.." && pwd)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT HUP INT TERM
 mkdir -p "$TEST_DIR/addon/www" "$TEST_DIR/addon/providers" "$TEST_DIR/web" "$TEST_DIR/scripts"
-for fn in Pin_Script_Repo Ensure_Update_Source Script_Source_Identity Load_Installed_Source \
-	Resolve_Installed_Source Configure_Test_Providers Provider_WebUI_Enabled Select_Install_Source \
+for fn in Unpinned_Script_Repo Pin_Script_Repo Ensure_Update_Source Script_Source_Identity Load_Installed_Source \
+	Resolve_Installed_Source Configure_Test_Providers Provider_WebUI_Enabled Select_Install_Source Bootstrap_Install \
 	Record_Install_Source Download_File Download_Asset Update_File Install_Providers \
 	Update_Addon_Files Sync_Addon_Files Update_Check Update_Version Create_Dirs Create_Symlinks Runtime_Init Menu_Install; do
 	sed -n "/^${fn}(){/,/^}/p" "$ROOT/vpnmgr.sh"
@@ -139,7 +139,9 @@ if Resolve_Installed_Source; then fail 'invalid explicit installed SHA adopted';
 none 'invalid explicit installed SHA'
 SCRIPT_BRANCH_OVERRIDE=topic/fixture
 unset VPNMGR_INSTALL_SHA
-if Select_Install_Source; then fail 'test bootstrap resolved its branch again'; fi
+: > "$REQUESTS"
+Select_Install_Source || fail 'normal direct install could not select its source'
+eq 'direct install resolves once' 1 "$(grep -c '^https://api.github.com/' "$REQUESTS")"
 
 # The branch override applies to every command, including develop/stable.
 Pin_Script_Repo main "$SHA_A"
@@ -147,6 +149,8 @@ eq 'test branch remains selected' topic/fixture "$SCRIPT_BRANCH"
 eq 'pinned test source' "https://raw.githubusercontent.com/fixture-owner/vpnmgr/$SHA_A" "$SCRIPT_REPO"
 
 # Explicit developer opt-in is independent of source routing and status labels.
+SCRIPT_BRANCH_OVERRIDE=""
+VPNMGR_TEST_PROVIDERS=""; Configure_Test_Providers; unset VPNMGR_TEST_PROVIDERS
 if Provider_WebUI_Enabled nordvpn UNTESTED; then fail 'untested provider enabled by default'; fi
 VPNMGR_TEST_PROVIDERS=nordvpn; Configure_Test_Providers
 Provider_WebUI_Enabled nordvpn UNTESTED || fail 'explicit test provider unavailable'
@@ -155,6 +159,9 @@ if Provider_WebUI_Enabled nordvpn TEMPLATE; then fail 'test opt-in exposed a tem
 Provider_WebUI_Enabled surfshark ACTIVE || fail 'active provider hidden'
 VPNMGR_TEST_PROVIDERS=""; Configure_Test_Providers; unset VPNMGR_TEST_PROVIDERS
 if Provider_WebUI_Enabled nordvpn UNTESTED; then fail 'test opt-in could not be removed'; fi
+SCRIPT_BRANCH_OVERRIDE=topic/fixture
+Configure_Test_Providers
+Provider_WebUI_Enabled nordvpn UNTESTED || fail 'normal pinned test install hid NordVPN'
 
 # Exercise actual forced-update calls, including environment passed through exec.
 VPNMGR_TEST_REEXEC_FILE="$TEST_DIR/reexec"; VPNMGR_TEST_FUNCTIONS="$TEST_DIR/functions"
@@ -210,7 +217,7 @@ done
 	SCRIPT_TEST_PROVIDER_FILE="$SCRIPT_DIR/.test_providers"
 	mkdir -p "$SCRIPT_WEB_DIR" "$SCRIPT_WEBPAGE_DIR"
 	SCRIPT_BRANCH_OVERRIDE=""; Pin_Script_Repo main "$SHA_A"
-	Select_Install_Source(){ :; }; Check_Lock(){ :; }; Clear_Lock(){ printf 'clear\n' >> "$TEST_DIR/lock-clears"; }
+	Select_Install_Source(){ :; }; Bootstrap_Install(){ :; }; Check_Lock(){ :; }; Clear_Lock(){ printf 'clear\n' >> "$TEST_DIR/lock-clears"; }
 	ScriptHeader(){ :; }; sleep(){ :; }; Check_Requirements(){ :; }; Conf_Exists(){ :; }
 	Auto_Cron(){ :; }; Auto_Startup(){ :; }; Auto_ServiceEvent(){ :; }; Shortcut_Script(){ :; }
 	Refresh_Provider_Cache(){ :; }; MainMenu(){ :; }

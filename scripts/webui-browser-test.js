@@ -30,11 +30,11 @@ function fixture(version = '2.6.12') {
   for (let i = 1; i <= 5; i++) {
     Object.assign(config, Object.fromEntries(Object.entries({managed:i <= 3 ? 'true':'false',provider:'NordVPN',customsettings:'true',protocol:i === 2 ? 'TCP':'UDP',type:'Standard',countryname:'Australia',countryid:'13',cityname:'Sydney',cityid:'100',schenabled:'false',schhours:'*',schmins:'0',schdays:'*'}).map(([k,v]) => ['vpn'+i+'_'+k,v])));
   }
-  return {version, family:version === '2.5.9' ? 'legacy':'modern',config,providers:'nordvpn|NordVPN\npia|PIA\n',records:new Map(),posts:[],redirects:0,delayDetection:false,busy:false,failSlot:0,hold:false,wrongStatus:false,configFailure:false,custom:{vpnmgr_version_local:'fixture',vpnmgr_version_server:'fixture',vpnmgr_version_source:'fixture@1234567',unrelated_setting:'preserve=\\value'},creds:{}};
+  return {version, family:version === '2.5.9' ? 'legacy':'modern',config,providers:'nordvpn|NordVPN\npia|PIA\n',records:new Map(),posts:[],recoveries:[],redirects:0,delayDetection:false,busy:false,failSlot:0,stoppedSlot:0,hold:false,wrongStatus:false,loseSettingsPost:false,recoveryLoss:false,recoveryAgeMs:0,runningApply:false,completeRunning:false,configFailure:false,custom:{vpnmgr_version_local:'fixture',vpnmgr_version_server:'fixture',vpnmgr_version_source:'fixture@1234567',unrelated_setting:'preserve=\\value'},creds:{}};
 }
 
 function clients() {
-  return Array.from({length:5}, (_,index) => ({slot:index+1,status:state.config['vpn'+(index+1)+'_managed'] !== 'true' ? 'unmanaged':state.failSlot === index+1 ? 'failed':'applied',connection:'not_requested'}));
+  return Array.from({length:5}, (_,index) => ({slot:index+1,status:state.config['vpn'+(index+1)+'_managed'] !== 'true' ? 'unmanaged':state.failSlot === index+1 ? 'failed':'applied',connection:state.config['vpn'+(index+1)+'_managed'] !== 'true' ? 'not_requested':state.failSlot === index+1 ? 'failed':state.stoppedSlot === index+1 ? 'verified_stopped':'connected'}));
 }
 function respond(res, code, body, type = 'text/plain') {
   res.writeHead(code, {'content-type':type,'cache-control':'no-store'});
@@ -57,7 +57,7 @@ const server = http.createServer(async (req,res) => {
     if (pathname === '/ext/vpnmgr/vpnmgr_www.js') return respond(res,200,script,'application/javascript');
     if (pathname === '/state.js') return respond(res,200,firmware,'application/javascript');
     if (pathname === '/ext/vpnmgr/providers.htm') return respond(res,200,state.providers);
-    if (pathname === '/ext/vpnmgr/nordvpn_countrydata.htm') return respond(res,200,JSON.stringify([{id:13,name:'Australia',cities:[{id:100,name:'Sydney'}]}]),'application/json');
+    if (pathname === '/ext/vpnmgr/nordvpn_countrydata.htm') return respond(res,200,JSON.stringify([{id:13,name:'Australia',cities:[{id:100,name:'Sydney'}]},{id:14,name:'Canada',cities:[{id:200,name:'Toronto'}]}]),'application/json');
     if (pathname === '/ext/vpnmgr/pia_countrydata.htm') return respond(res,200,'AU_Sydney\nUK_London\n');
     if (pathname === '/ext/vpnmgr/config.htm') return respond(res,state.configFailure ? 503:200,Object.entries(state.config).map(([k,v]) => k+'='+v).join('\n'));
     if (pathname === '/unexpected-redirect') { state.redirects++; return respond(res,500,'Firmware response executed'); }
@@ -67,7 +67,7 @@ const server = http.createServer(async (req,res) => {
       const fields = new URLSearchParams(body);
       const action = fields.get('action_script');
       state.posts.push({action,fields});
-      const match = /^start_vpnmgr(runtime|prepare|apply)_(\d+)$/.exec(action || '');
+      const match = /^start_vpnmgr(runtime|prepare|apply|recover)_(\d+)$/.exec(action || '');
       assert.ok(match, 'unexpected control action '+action);
       const [,kind,id] = match;
       if (kind === 'runtime') {
@@ -75,8 +75,12 @@ const server = http.createServer(async (req,res) => {
         state.delayDetection = false;
       } else if (kind === 'prepare') {
         assert.equal(fields.has('amng_custom'),false,'reservation must precede the settings payload');
-        state.records.set('apply_'+id+'.json',{request:id,state:state.busy ? 'busy':'ready'});
-      } else {
+        state.records.set('apply_'+id+'.json',{request:id,state:state.busy ? 'busy':'ready',readyAt:Date.now()-state.recoveryAgeMs});
+        state.recoveryAgeMs = 0;
+      } else if (kind === 'apply') {
+        // A rejected gateway response models no firmware delivery. Destroying a
+        // reused socket can make Chrome transparently retry the POST itself.
+        if (state.loseSettingsPost) { state.loseSettingsPost = false; return respond(res,503,'Not delivered to firmware'); }
         assert.equal(state.records.get('apply_'+id+'.json').state,'ready','apply must own a ready reservation');
         const payload = JSON.parse(fields.get('amng_custom'));
         assert.equal(payload.vpnmgr_request_id,id);
@@ -89,14 +93,28 @@ const server = http.createServer(async (req,res) => {
             else state.config[short] = String(value);
           }
         }
-        state.records.set('apply_'+id+'.json',{request:id,state:'done',merged:true,clients:clients(),message:'complete'});
+        state.records.set('apply_'+id+'.json',state.runningApply ? {request:id,state:'running',merged:true,clients:Array.from({length:5},(_,index)=>({slot:index+1,status:'pending',connection:'unknown'})),message:'running'} : {request:id,state:'done',merged:true,clients:clients(),message:'complete'});
+        state.runningApply = false;
+      } else {
+        assert.equal(fields.has('amng_custom'),false,'recovery control must never resend settings');
+        state.recoveries.push({id,state:state.records.get('apply_'+id+'.json').state});
+        if (state.recoveryLoss) { state.recoveryLoss = false; return respond(res,503,'Recovery not delivered to firmware'); }
+        const record = state.records.get('apply_'+id+'.json');
+        if (record && record.state === 'ready' && Date.now()-record.readyAt >= 60000) {
+          state.records.set('apply_'+id+'.json',{request:id,state:'failed',merged:false,clients:Array.from({length:5},(_,index)=>({slot:index+1,status:'pending',connection:'unknown'})),message:'expired'});
+        }
       }
       // The real firmware returns executable callbacks/reload code. AJAX must leave this inert.
       return respond(res,200,'<script>parent.location.replace("/unexpected-redirect")</script>','text/html');
     }
     if (pathname.startsWith('/ext/vpnmgr/runtime/')) {
       const name = pathname.split('/').pop();
-      const result = state.records.get(name);
+      let result = state.records.get(name);
+      if (result && name.startsWith('apply_') && result.state === 'running' && state.completeRunning) {
+        result = {request:result.request,state:'done',merged:true,clients:clients(),message:'complete'};
+        state.records.set(name,result);
+        state.completeRunning = false;
+      }
       if (!result || result.misses-- > 0 || (name.startsWith('apply_') && state.hold && result.state === 'done')) return respond(res,404,'Not ready');
       return respond(res,200,JSON.stringify(state.wrongStatus && result.state === 'done' && name.startsWith('apply_') ? {...result,request:'999'}:result),'application/json');
     }
@@ -122,6 +140,15 @@ async function until(expression, label, limit = 15000) {
     await pause(100);
   }
   throw new Error('Timed out: '+label+'; '+await execute('return JSON.stringify({config:window.vpnmgr_configState,runtime:window.vpnmgr_runtimeState,summary:document.querySelector("#vpnmgr_apply_summary").textContent,alerts:window.fixtureAlerts})'));
+}
+async function untilHost(predicate, label, limit = 15000) {
+  const deadline = Date.now()+limit;
+  while (Date.now() < deadline) {
+    if (state.serverError) throw new Error(state.serverError);
+    if (predicate()) return;
+    await pause(100);
+  }
+  throw new Error('Timed out waiting for fixture: '+label);
 }
 async function load() {
   await wd('POST','/url',{url:pageUrl});
@@ -231,15 +258,98 @@ async function run() {
   assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),true);
   await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
   assert.equal(await execute('return vpnmgr_pendingApply.polling'),false);
-  const posted = state.posts.length;
+  const applyPostsBeforeRecovery = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
+  const recoveriesBefore = state.recoveries.length;
   state.hold = false;
   state.wrongStatus = true;
   await click('#btnContinueApply');
   await until('document.querySelector("#vpnmgr_apply_summary").textContent.indexOf("stale") !== -1','stale result rejected');
-  assert.equal(state.posts.length,posted,'continue checking must not repost a payload');
+  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,applyPostsBeforeRecovery,'continue checking must not repost a payload');
+  assert.equal(state.recoveries.length,recoveriesBefore+1,'continue checking requests safe same-ID recovery');
   state.wrongStatus = false;
   await until('!vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','late result');
   assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),false);
+
+  state = fixture();
+  state.stoppedSlot = 1;
+  await load();
+  await save();
+  assert.equal(state.records.get('apply_'+state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_(\d+)$/)[1]+'.json').clients[0].connection,'verified_stopped');
+  assert.match(await execute('return document.querySelector("#vpnmgr_client_status_1").textContent'),/verified; restored to stopped/);
+  assert.match(await execute('return document.querySelector("#vpnmgr_apply_summary").textContent'),/restored to stopped/);
+
+  state = fixture();
+  state.loseSettingsPost = true;
+  state.recoveryAgeMs = 61000;
+  await load();
+  await click('#btnSaveConfig');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply"','lost settings POST after ready');
+  await untilHost(() => state.posts.some(post => post.action.startsWith('start_vpnmgrapply_')),'lost settings POST reaches fixture');
+  await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
+  await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','lost POST timeout');
+  const lostApplyCount = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
+  await click('#btnContinueApply');
+  await until('!vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','expired reservation recovery');
+  assert.equal(state.recoveries.length,1);
+  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,lostApplyCount,'recovery must not repeat the lost payload');
+  assert.match(await execute('return document.querySelector("#vpnmgr_apply_summary").textContent'),/expired/);
+  assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),false);
+
+  state = fixture();
+  state.loseSettingsPost = true;
+  state.recoveryLoss = true;
+  state.recoveryAgeMs = 61000;
+  await load();
+  await click('#btnSaveConfig');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply"','recovery POST loss setup');
+  await untilHost(() => state.posts.some(post => post.action.startsWith('start_vpnmgrapply_')),'apply request reaches fixture before recovery loss');
+  await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
+  await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','recovery POST loss timeout');
+  const recoveryLossApplyCount = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length;
+  await click('#btnContinueApply');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.polling && document.querySelector("#vpnmgr_apply_summary").textContent.indexOf("still reserved") !== -1','recovery acknowledgement lost');
+  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,recoveryLossApplyCount);
+  assert.equal(await execute('return document.form.vpnmgr_vpn1_pwd.disabled'),true,'uncertain recovery keeps config frozen');
+  assert.equal(await execute('return document.querySelector("#btnReloadSettings").style.display !== "none"'),true,'reload remains an explicit escape');
+
+  state = fixture();
+  state.runningApply = true;
+  await load();
+  await click('#btnSaveConfig');
+  await until('vpnmgr_pendingApply && vpnmgr_pendingApply.phase === "apply" && document.querySelector("#vpnmgr_apply_summary").textContent.indexOf("in progress") !== -1','running apply');
+  const runningId = state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).slice(-1)[0].action.match(/_(\d+)$/)[1];
+  await execute('vpnmgr_pendingApply.startedAt=0;PollApplyStatus(vpnmgr_pendingApply);');
+  await until('vpnmgr_pendingApply.timedOut && !vpnmgr_pendingApply.polling','running apply timeout');
+  await click('#btnContinueApply');
+  await untilHost(() => state.recoveries.length === 1,'running apply recovery request');
+  assert.equal(state.recoveries[0].state,'running','recovery must leave running work unchanged');
+  state.completeRunning = true;
+  await until('!vpnmgr_pendingApply && !document.querySelector("#btnSaveConfig").disabled','running apply completes');
+  assert.equal(state.records.get('apply_'+runningId+'.json').state,'done');
+  assert.equal(state.posts.filter(post => post.action.startsWith('start_vpnmgrapply_')).length,1);
+
+  state = fixture();
+  state.config.vpn1_cityname = 'Melbourne';
+  state.config.vpn1_cityid = '999';
+  await load();
+  assert.equal(await execute('return document.form.vpnmgr_vpn1_cityname.value'),'Melbourne');
+  await save();
+  assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,'999','unchanged unavailable city keeps its saved ID');
+  await load();
+  await execute('document.form.vpnmgr_vpn1_cityname.value="Sydney";');
+  await save();
+  assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,100,'changed city uses its current catalogue ID');
+  await load();
+  await execute('var country=document.form.vpnmgr_vpn1_countryname;country.value="Canada";setCitiesforCountry(country);document.form.vpnmgr_vpn1_cityname.value="Toronto";');
+  await save();
+  assert.equal(state.lastPayload.vpnmgr_vpn1_countryid,14,'changed country uses current catalogue ID');
+  assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,200,'changed country and city use current catalogue ID');
+  await load();
+  await click('#vpnmgr_vpn1_prov_pia');
+  await save();
+  assert.equal(state.lastPayload.vpnmgr_vpn1_provider,'PIA');
+  assert.equal(state.lastPayload.vpnmgr_vpn1_countryid,0,'changed provider does not inherit old country ID');
+  assert.equal(state.lastPayload.vpnmgr_vpn1_cityid,0,'changed provider does not inherit old city ID');
 
   state = fixture();
   state.providers = 'pia|PIA\n';
@@ -271,7 +381,7 @@ async function run() {
   assert.equal(await execute('return document.querySelectorAll("[id^=table_config_vpn]").length'),5);
   assert.equal(await execute('return document.form.vpnmgr_vpn2_protocol.value'),'TCP');
   assert.equal(state.redirects,0);
-  console.log('Real Chrome WebUI journeys passed: runtime families/unknown, five slots, Save/reload, repeated edits, provider/schedule changes, busy/partial/stale/late results, unavailable provider, load retry and inert firmware response.');
+  console.log('Real Chrome WebUI journeys passed: runtime families/unknown, five slots, Save/reload, repeated edits, provider/schedule/location changes, busy/partial/stale/late results, reservation recovery/lost acknowledgements, stopped-client status, unavailable provider, load retry and inert firmware response.');
   console.log('One isolated browser session; '+((Date.now()-started)/1000).toFixed(2)+'s wall. Firmware endpoints were simulated; no router contacted.');
 }
 

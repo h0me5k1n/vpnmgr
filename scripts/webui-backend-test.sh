@@ -5,7 +5,7 @@ set -eu
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT HUP INT TERM
-for fn in Runtime_Init Runtime_ValidID Runtime_Write Runtime_Detect Runtime_Status Runtime_Release Runtime_Prepare Runtime_Merge Runtime_Apply Runtime_Apply_Cleanup Parse_OpenVPN_Version Detect_OpenVPN_Runtime; do
+for fn in Runtime_Init Runtime_ValidID Runtime_Write Runtime_Detect Runtime_Status Runtime_Release Runtime_Recover Runtime_Prepare Runtime_Merge Runtime_Apply Runtime_Apply_Cleanup Parse_OpenVPN_Version Detect_OpenVPN_Runtime; do
 	sed -n "/^${fn}(){/,/^}/p" "$ROOT/vpnmgr.sh"
 done | sed "s|/usr/sbin/openvpn|$TEST_DIR/openvpn|g" > "$TEST_DIR/functions"
 . "$TEST_DIR/functions"
@@ -34,9 +34,9 @@ if Runtime_ValidID 123456789012345678901234567890123; then fail 'long nonce acce
 Runtime_Prepare 1; Runtime_Prepare 2
 contains "$VPNMGR_RUNTIME_DIR/apply_1.json" '"state":"ready"' 'reservation ready'
 contains "$VPNMGR_RUNTIME_DIR/apply_2.json" '"state":"busy"' 'second reservation busy'
-printf '0\n' > "$VPNMGR_RUNTIME_DIR/apply.lock/ready"
+printf '0\n' > "$VPNMGR_RUNTIME_DIR/apply.lock/ready.1"
 Runtime_Prepare 3
-contains "$VPNMGR_RUNTIME_DIR/apply_1.json" '"state":"superseded"' 'expired ready'
+contains "$VPNMGR_RUNTIME_DIR/apply_1.json" '"message":"expired"' 'expired ready'
 contains "$VPNMGR_RUNTIME_DIR/apply_3.json" '"state":"ready"' 'replacement ready'
 cat > "$SCRIPT_CONF" <<'DATA'
 vpn1_managed=false
@@ -144,6 +144,64 @@ printf 'vpnmgr_request_id 11\nvpnmgr_vpn1_managed true\n' > "$VPNMGR_SETTINGS_FI
 )
 contains "$VPNMGR_RUNTIME_DIR/apply_11.json" '"message":"status_failed"' 'final failure status'
 [ ! -d "$VPNMGR_RUNTIME_DIR/apply.lock" ] || fail 'final failure retained lock'
+# Recover a lost settings POST without submitting or merging it a second time.
+Runtime_Prepare 20
+Runtime_Recover 20
+[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/ready.20" ] || fail 'young reservation expired'
+Runtime_Recover 999
+[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/ready.20" ] || fail 'wrong request changed reservation'
+printf '0\n' > "$VPNMGR_RUNTIME_DIR/apply.lock/ready.20"
+(
+	Runtime_Write(){ return 1; }
+	if Runtime_Recover 20; then fail 'failed expiry publication accepted'; fi
+)
+[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/ready.20" ] || fail 'publication failure stranded recovery'
+Runtime_Recover 20
+contains "$VPNMGR_RUNTIME_DIR/apply_20.json" '"message":"expired"' 'lost POST expiry'
+[ ! -d "$VPNMGR_RUNTIME_DIR/apply.lock" ] || fail 'expired reservation not released'
+cp "$SCRIPT_CONF" "$TEST_DIR/before-late"
+printf 'vpnmgr_request_id 20\nvpnmgr_vpn1_location late-must-not-merge\n' > "$VPNMGR_SETTINGS_FILE"
+if Runtime_Apply 20; then fail 'late expired apply accepted'; fi
+cmp -s "$SCRIPT_CONF" "$TEST_DIR/before-late" || fail 'late expired payload merged'
+Runtime_Prepare 21
+printf 'vpnmgr_request_id 21\nvpnmgr_vpn1_managed true\n' > "$VPNMGR_SETTINGS_FILE"
+(
+	ManageVPN(){
+		Runtime_Recover 21
+		contains "$VPNMGR_RUNTIME_DIR/apply_21.json" '"state":"running"' 'running apply was expired'
+	}
+	Runtime_Apply 21
+)
+contains "$VPNMGR_RUNTIME_DIR/apply_21.json" '"state":"done"' 'late delivered apply completion'
+cp "$VPNMGR_RUNTIME_DIR/apply_21.json" "$TEST_DIR/completed"
+Runtime_Recover 21
+cmp -s "$VPNMGR_RUNTIME_DIR/apply_21.json" "$TEST_DIR/completed" || fail 'completed result changed'
+# Pause an old process at its claim while expiry/release + another Prepare occur.
+# The old process must not consume the newer request's ready token (ABA race).
+for old in 80 82; do
+	new=$((old + 1)); Runtime_Prepare "$old"
+	printf '0\n' > "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$old"
+	(
+		# Match the production manager's shell flags during the injected race;
+		# every observed outcome is checked explicitly below.
+		set +e
+		mv(){
+			if [ "$1" = "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$old" ]; then
+				rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$old" "$VPNMGR_RUNTIME_DIR/apply.lock/owner"
+				rmdir "$VPNMGR_RUNTIME_DIR/apply.lock"
+				(Runtime_Prepare "$new") || fail 'intervening prepare failed'
+				touch "$TEST_DIR/raced.$old"
+			fi
+			command mv "$@"
+		}
+		if [ "$old" = 80 ]; then Runtime_Recover "$old" || fail 'old recovery claim failed'; else Runtime_Apply "$old" || fail 'old apply claim failed'; fi
+	)
+	[ -f "$TEST_DIR/raced.$old" ] || fail 'claim race not exercised'
+	[ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner")" = "$new" ] || fail 'old process released newer owner'
+	[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$new" ] || fail 'old process consumed newer ready token'
+	printf '0\n' > "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$new"
+	Runtime_Recover "$new"
+done
 grep -Fq '"${SCRIPT_NAME}runtime_"*)' "$ROOT/vpnmgr.sh" || fail 'runtime dispatch'
 grep -Fq '[ "$3" = "$SCRIPT_NAME" ]' "$ROOT/vpnmgr.sh" || fail 'legacy dispatch'
 # Exercise the actual restart boundary with inert processes and services.
@@ -213,5 +271,24 @@ DATA
 	AUTO_CONNECT=no
 	UpdateVPNConfig unattended 1 0 || fail 'update without auto-connect'
 	[ "$VPNMGR_UPDATE_CONNECTION" = not_requested ] || fail 'not-requested connection status'
+	# A successful verification must report the final restored state accurately.
+	AUTO_CONNECT=yes; TEST_CONNECTION_STATE=0; TEST_STOP_COUNT=0; STOP_FAIL=no
+	getConnectState(){ printf '%s' "$TEST_CONNECTION_STATE"; }
+	RestartVPNClient(){ TEST_CONNECTION_STATE=2; }
+	service(){
+		[ "$1" = stop_vpnclient1 ] || return 1
+		TEST_STOP_COUNT=$((TEST_STOP_COUNT + 1))
+		[ "$STOP_FAIL" = no ] || return 1
+		TEST_CONNECTION_STATE=0
+	}
+	UpdateVPNConfig unattended 1 0 || fail 'stopped client verification failed'
+	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION" = 0:verified_stopped ] || fail 'stopped client falsely reported connected'
+	[ "$TEST_STOP_COUNT" = 1 ] || fail 'prior stopped state not restored'
+	TEST_STOP_COUNT=0
+	UpdateVPNConfig unattended 1 2 || fail 'prior connected client update failed'
+	[ "$TEST_CONNECTION_STATE:$VPNMGR_UPDATE_CONNECTION:$TEST_STOP_COUNT" = 2:connected:0 ] || fail 'prior connected client was stopped'
+	STOP_FAIL=yes
+	if UpdateVPNConfig unattended 1 0; then fail 'failed state restoration accepted'; fi
+	[ "$VPNMGR_UPDATE_CONNECTION" = unknown ] || fail 'failed stop still reported connected'
 )
 printf 'WebUI backend request, merge, and update checks passed.\n'  

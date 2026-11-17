@@ -67,6 +67,19 @@ a different profile or preset family after a router update.
    A timeout remains unconfirmed. Continue checking the SAME request without
    resubmitting; reload saved settings only on an explicit user action.
 
+After an apply timeout, Continue checking POSTs `start_vpnmgrrecover_<id>` as a
+control-only request before polling. The backend expires only an unused matching
+reservation older than 60 seconds, competing atomically with Apply through its
+request-specific `ready.<id>` token. Running or finished work is unchanged.
+Publication failure restores a retryable token. Keep the form frozen until an
+authoritative terminal result; Reload is available as an explicit timeout escape.
+`verified_stopped` means a connection was verified and the previous stopped state
+was restored and observed. Do not display it as currently connected or failed.
+
+Location retention must compare the loaded provider/country/city identity before
+reusing an unavailable city's ID. Current catalogue selections use current IDs;
+an actual selection change must not inherit an unrelated saved ID.
+
 Use AJAX `dataType:'text'` for control/apply POST responses. Merlin's
 `start_apply.htm` returns executable callback/reload JavaScript; it must remain
 inert. Do not submit Save through the hidden iframe, override global firmware

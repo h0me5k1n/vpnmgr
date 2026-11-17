@@ -59,7 +59,7 @@ function addElement(name,value,type,checked,disabled){
 function applyResponse(request,state,merged,statuses){
 	var clients = [];
 	for(var i=1; i<=5; i++) clients.push({slot:i,status:statuses && statuses[i-1] || 'applied',connection:statuses && statuses[i-1] == 'unmanaged' ? 'not_requested' : 'connected'});
-	return {request:request,state:state,merged:merged,clients:clients,message:state == 'done' ? 'complete' : 'running'};
+	return {request:request,state:state,merged:merged,clients:clients,message:state == 'done' ? 'complete' : state == 'running' ? 'running' : 'expired'};
 }
 
 function testRequestIdsAndRuntimeContract(){
@@ -187,12 +187,41 @@ function testFreshPayloadAndAllSlots(){
 	assert.strictEqual(context.custom_settings.vpnmgr_vpn1_usn,undefined,'source settings must not be mutated');
 	assert.strictEqual(second.other_form_value,undefined,'only document.form controls are serialized');
 	formElements[1].value = 'NordVPN';
-	context.window.vpnmgr_settings = [['vpn1_countryid','440'],['vpn1_cityid','918']];
+	context.window.vpnmgr_settings = [['vpn1_provider','nordvpn'],['vpn1_countryname','Country 1'],['vpn1_cityname','City 1'],['vpn1_countryid','440'],['vpn1_cityid','918']];
 	var unavailableProvider = context.BuildCustomSettingsPayload('2222222222222222222');
 	assert.strictEqual(unavailableProvider.vpnmgr_vpn1_countryname,'Country 1');
 	assert.strictEqual(unavailableProvider.vpnmgr_vpn1_cityname,'City 1');
 	assert.strictEqual(unavailableProvider.vpnmgr_vpn1_countryid,'440','missing provider data must retain the saved country ID');
 	assert.strictEqual(unavailableProvider.vpnmgr_vpn1_cityid,'918','missing provider data must retain the saved city ID');
+	context.window.vpnmgr_settings = [['vpn1_provider','nordvpn'],['vpn1_countryname','Australia'],['vpn1_cityname','Melbourne'],['vpn1_countryid','13'],['vpn1_cityid','999']];
+	context.providerCountries.nordvpn = [{id:'13',name:'Australia',cities:[{id:'100',name:'Sydney'}]}];
+	formElements[1].value = 'NordVPN';
+	formElements[7].value = 'Australia';
+	formElements[8].value = 'Melbourne';
+	var retainedCity = context.BuildCustomSettingsPayload('3333333333333333333');
+	assert.strictEqual(retainedCity.vpnmgr_vpn1_countryid,'13');
+	assert.strictEqual(retainedCity.vpnmgr_vpn1_cityid,'999','unchanged unavailable city retains its saved ID');
+	formElements[8].value = 'Sydney';
+	var changedCity = context.BuildCustomSettingsPayload('4444444444444444444');
+	assert.strictEqual(changedCity.vpnmgr_vpn1_cityid,'100','a catalogue selection uses its current city ID');
+	formElements[8].value = 'Perth';
+	var changedToUnlistedCity = context.BuildCustomSettingsPayload('5555555555555555555');
+	assert.strictEqual(changedToUnlistedCity.vpnmgr_vpn1_cityid,0,'changed unavailable city must not inherit old ID');
+	formElements[7].value = 'Germany';
+	var changedCountry = context.BuildCustomSettingsPayload('6666666666666666666');
+	assert.strictEqual(changedCountry.vpnmgr_vpn1_countryid,0);
+	assert.strictEqual(changedCountry.vpnmgr_vpn1_cityid,0,'changed country must not inherit old city ID');
+	formElements[1].value = 'PIA';
+	formElements[7].value = 'Australia';
+	formElements[8].value = 'Melbourne';
+	var changedProvider = context.BuildCustomSettingsPayload('7777777777777777777');
+	assert.strictEqual(changedProvider.vpnmgr_vpn1_countryid,0);
+	assert.strictEqual(changedProvider.vpnmgr_vpn1_cityid,0,'changed provider must not inherit NordVPN IDs');
+	context.providerCountries.nordvpn = [];
+	formElements[1].value = 'NordVPN';
+	var noCatalogue = context.BuildCustomSettingsPayload('8888888888888888888');
+	assert.strictEqual(noCatalogue.vpnmgr_vpn1_countryid,'13');
+	assert.strictEqual(noCatalogue.vpnmgr_vpn1_cityid,'999','unchanged values survive a missing catalogue');
 	var saveButton = addElement('button','Save','button');
 	var pending = {};
 	context.vpnmgr_pendingApply = pending;
@@ -302,6 +331,124 @@ function testPrepareGateAndNoncePost(){
 	assert.strictEqual(calls[2].url,'/ext/vpnmgr/runtime/apply_'+requestId+'.json');
 }
 
+function testRecoveryAfterLostSettingsPost(){
+	formElements.length = 0;
+	var frozenPassword = addElement('vpnmgr_vpn1_pwd','keep-this-value','password',false,false);
+	var pending = {requestId:'1212121212121212121',payload:{vpnmgr_request_id:'1212121212121212121'},fields:[{name:'action_script',value:'start_vpnmgrapply_1212121212121212121'},{name:'amng_custom',value:'{"vpnmgr_request_id":"1212121212121212121"}'}],phase:'apply',polling:false};
+	context.vpnmgr_pendingApply = pending;
+	context.FreezeConfigControls(pending);
+	var applyPosts = 0, recoverPosts = 0, statusReads = 0, recoveryApplied = false;
+	jqueryState.ajax = function(options){
+		if(options.url == '/start_apply.htm'){
+			var action = options.data.filter(function(field){return field.name == 'action_script';})[0].value;
+			if(action.indexOf('start_vpnmgrapply_') == 0){ applyPosts++; options.error(); return; }
+			if(action.indexOf('start_vpnmgrrecover_') == 0){
+				recoverPosts++;
+				assert.strictEqual(action,'start_vpnmgrrecover_'+pending.requestId,'recovery must stay correlated to the reservation');
+				assert.strictEqual(options.dataType,'text');
+				assert.strictEqual(options.data.filter(function(field){return field.name == 'amng_custom';}).length,0,'recovery must not resend settings');
+				recoveryApplied = true;
+				options.success('inert redirect text');
+				return;
+			}
+			if(action.indexOf('start_vpnmgrruntime_') == 0){ options.success(''); return; }
+		}
+		if(options.url.indexOf('/runtime/apply_') != -1){
+			statusReads++;
+			if(recoveryApplied){
+				var expired = applyResponse(pending.requestId,'failed',false,['pending','pending','pending','pending','pending']);
+				expired.message = 'expired';
+				options.success(expired);
+			}
+			else options.success({request:pending.requestId,state:'ready'});
+			return;
+		}
+		if(options.url.indexOf('/runtime/detection_') != -1){
+			var id = options.url.match(/detection_(\d+)\.json/)[1];
+			options.success({request:id,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
+		}
+	};
+	context.PostPreparedApply(pending);
+	assert.strictEqual(applyPosts,1,'the lost settings POST is attempted once');
+	assert.strictEqual(statusReads,1,'the ready reservation is recognized after POST loss');
+	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('submission is unconfirmed') != -1,'ready state explains uncertainty without a malformed-response message');
+	pending.startedAt = 0;
+	context.PollApplyStatus(pending);
+	assert.strictEqual(pending.timedOut,true);
+	assert.strictEqual(frozenPassword.disabled,true);
+	assert.strictEqual(jqueryState.shown['#btnReloadSettings'],true,'timeout offers reload as an explicit escape');
+	context.ContinueApplyChecking();
+	assert.strictEqual(recoverPosts,1);
+	assert.strictEqual(context.vpnmgr_pendingApply,null,'expired reservation is terminal and releases the form');
+	assert.strictEqual(frozenPassword.disabled,false,'original form state is restored');
+	assert.strictEqual(frozenPassword.value,'keep-this-value','recovery never repopulates old values');
+	assert.strictEqual(applyPosts,1,'recovery never resubmits the settings payload');
+	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('expired') != -1);
+}
+
+function testRecoveryLossAndLateApplyAreUncertainSafe(){
+	function setupPending(requestId){
+		formElements.length = 0;
+		var field = addElement('vpnmgr_vpn1_pwd','pending-value','password',false,false);
+		var pending = {requestId:requestId,payload:{vpnmgr_request_id:requestId},fields:[],phase:'apply',polling:false,timedOut:true};
+		context.vpnmgr_pendingApply = pending;
+		context.FreezeConfigControls(pending);
+		return {pending:pending,field:field};
+	}
+
+	var lostRecovery = setupPending('1313131313131313131');
+	var applies = 0, recovers = 0;
+	jqueryState.ajax = function(options){
+		if(options.url == '/start_apply.htm'){
+			var action = options.data.filter(function(field){return field.name == 'action_script';})[0].value;
+			if(action.indexOf('start_vpnmgrrecover_') == 0){ recovers++; options.error(); return; }
+			if(action.indexOf('start_vpnmgrapply_') == 0) applies++;
+		}
+		if(options.url.indexOf('/runtime/apply_') != -1) options.success({request:lostRecovery.pending.requestId,state:'ready'});
+	};
+	context.ContinueApplyChecking();
+	assert.strictEqual(recovers,1);
+	assert.strictEqual(applies,0);
+	assert.strictEqual(context.vpnmgr_pendingApply,lostRecovery.pending,'lost recovery acknowledgement leaves status uncertain');
+	assert.strictEqual(lostRecovery.field.disabled,true,'controls stay frozen while recovery is uncertain');
+	assert.strictEqual(jqueryState.shown['#btnContinueApply'],false,'polling resumes after recovery POST loss');
+
+	['running','done'].forEach(function(initialState){
+		var current = setupPending(initialState == 'running' ? '1414141414141414141':'1515151515151515151');
+		var statusState = initialState;
+		var recoveryState = '';
+		var applyCount = 0;
+		jqueryState.ajax = function(options){
+			if(options.url == '/start_apply.htm'){
+				var action = options.data.filter(function(field){return field.name == 'action_script';})[0].value;
+				if(action.indexOf('start_vpnmgrapply_') == 0) applyCount++;
+				if(action.indexOf('start_vpnmgrrecover_') == 0){ recoveryState = statusState; options.success(''); }
+				else if(action.indexOf('start_vpnmgrruntime_') == 0) options.success('');
+				return;
+			}
+			if(options.url.indexOf('/runtime/apply_') != -1){
+				if(statusState == 'running') options.success(applyResponse(current.pending.requestId,'running',true));
+				else options.success(applyResponse(current.pending.requestId,'done',true));
+				return;
+			}
+			if(options.url.indexOf('/runtime/detection_') != -1){
+				var id = options.url.match(/detection_(\d+)\.json/)[1];
+				options.success({request:id,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
+			}
+		};
+		context.ContinueApplyChecking();
+		assert.strictEqual(recoveryState,initialState,'recovery leaves running/done backend state unchanged');
+		if(initialState == 'running'){
+			assert.strictEqual(context.vpnmgr_pendingApply,current.pending,'recovery does not cancel a running application');
+			statusState = 'done';
+			context.queuedTimer();
+		}
+		assert.strictEqual(context.vpnmgr_pendingApply,null,'late applied delivery is accepted as authoritative completion');
+		assert.strictEqual(current.field.disabled,false);
+		assert.strictEqual(applyCount,0,'recovery and late polling never repost settings');
+	});
+}
+
 function testPartialApplyResult(){
 	var pending = {requestId:'9876543210987654321',phase:'apply',polling:true};
 	context.vpnmgr_pendingApply = pending;
@@ -317,6 +464,27 @@ function testPartialApplyResult(){
 	context.FinishApplyResult(pending,data);
 	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('VPN Client 2') != -1);
 	assert.strictEqual(jqueryState.shown['#btnReloadSettings'],true,'reload remains a user action');
+}
+
+function testVerifiedStoppedConnectionStatus(){
+	var pending = {requestId:'1616161616161616161',phase:'apply',polling:true};
+	context.vpnmgr_pendingApply = pending;
+	var data = applyResponse(pending.requestId,'done',true);
+	data.clients[0].connection = 'verified_stopped';
+	assert.strictEqual(context.ApplyResponseValid(data),true);
+	context.RenderApplyStatus(data);
+	assert.ok(jqueryState.text['#vpnmgr_client_status_1'].indexOf('verified; restored to stopped') != -1);
+	assert.strictEqual(jqueryState.text['#vpnmgr_client_status_1'].indexOf('connected') == -1,true);
+	jqueryState.ajax = function(options){
+		if(options.url == '/start_apply.htm') options.success('');
+		else if(options.url.indexOf('/runtime/detection_') != -1){
+			var id = options.url.match(/detection_(\d+)\.json/)[1];
+			options.success({request:id,state:'done',version:'2.6',number:'260000',family:'modern',status:'detected'});
+		}
+	};
+	context.FinishApplyResult(pending,data);
+	assert.ok(jqueryState.text['#vpnmgr_apply_summary'].indexOf('restored to stopped') != -1);
+	assert.strictEqual(jqueryState.text['#vpnmgr_apply_summary'].indexOf('currently connected') == -1,true);
 }
 
 function testLoadedSettingsContract(){
@@ -341,5 +509,8 @@ testStaleRuntimeResponseIgnored();
 testFreshPayloadAndAllSlots();
 testStatusCorrelationAndLateCompletion();
 testPrepareGateAndNoncePost();
+testRecoveryAfterLostSettingsPost();
+testRecoveryLossAndLateApplyAreUncertainSafe();
 testPartialApplyResult();
+testVerifiedStoppedConnectionStatus();
 process.stdout.write('Web UI contract checks passed.\n');

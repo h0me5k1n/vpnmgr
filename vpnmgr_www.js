@@ -789,16 +789,20 @@ function BuildCustomSettingsPayload(requestId){
 			var countries = providerCountries.nordvpn || [];
 			var countryEntry = null;
 			for(var c=0; c<countries.length; c++) if(countries[c].name == country){ countryEntry = countries[c]; break; }
+			var savedLocationUnchanged = IsLoadedLocationUnchanged(slot,provider,country,city);
 			if(countryEntry){
 				output['vpnmgr_vpn'+slot+'_countryid'] = countryEntry.id || 0;
 				var cityId = 0;
 				var cities = countryEntry.cities || [];
-				for(var ci=0; ci<cities.length; ci++) if(cities[ci].name == city){ cityId = cities[ci].id || 0; break; }
+				var cityFound = false;
+				for(var ci=0; ci<cities.length; ci++) if(cities[ci].name == city){ cityId = cities[ci].id || 0; cityFound = true; break; }
+				if(!cityFound && savedLocationUnchanged) cityId = GetLoadedSetting('vpn'+slot+'_cityid') || 0;
 				output['vpnmgr_vpn'+slot+'_cityid'] = cityId;
 			}
 			else{
-				output['vpnmgr_vpn'+slot+'_countryid'] = source['vpnmgr_vpn'+slot+'_countryid'] || GetLoadedSetting('vpn'+slot+'_countryid') || 0;
-				output['vpnmgr_vpn'+slot+'_cityid'] = source['vpnmgr_vpn'+slot+'_cityid'] || GetLoadedSetting('vpn'+slot+'_cityid') || 0;
+				var savedProviderCountryUnchanged = IsLoadedProviderCountryUnchanged(slot,provider,country);
+				output['vpnmgr_vpn'+slot+'_countryid'] = savedProviderCountryUnchanged ? GetLoadedSetting('vpn'+slot+'_countryid') || 0 : 0;
+				output['vpnmgr_vpn'+slot+'_cityid'] = savedLocationUnchanged ? GetLoadedSetting('vpn'+slot+'_cityid') || 0 : 0;
 			}
 		}
 		else{
@@ -808,6 +812,15 @@ function BuildCustomSettingsPayload(requestId){
 	}
 	output.vpnmgr_request_id = requestId;
 	return output;
+}
+
+function IsLoadedLocationUnchanged(slot,provider,country,city){
+	return city !== '' && IsLoadedProviderCountryUnchanged(slot,provider,country) && GetLoadedSetting('vpn'+slot+'_cityname') == city;
+}
+
+function IsLoadedProviderCountryUnchanged(slot,provider,country){
+	var savedProvider = GetLoadedSetting('vpn'+slot+'_provider');
+	return savedProvider !== '' && savedProvider.toLowerCase() == provider.toLowerCase() && country !== '' && GetLoadedSetting('vpn'+slot+'_countryname') == country;
 }
 
 function CollectFormFields(actionScript,customPayload){
@@ -842,17 +855,44 @@ function BeginApplyPolling(pending,phase){
 
 function ContinueApplyChecking(){
 	var pending = vpnmgr_pendingApply;
-	if(!pending || pending.polling) return;
+	if(!pending || pending.polling || pending.recovering) return;
 	$j('#btnContinueApply').hide();
+	if(pending.phase == 'apply' && pending.timedOut){
+		RecoverApplyReservation(pending);
+		return;
+	}
 	BeginApplyPolling(pending,pending.phase);
+}
+
+function RecoverApplyReservation(pending){
+	if(vpnmgr_pendingApply !== pending || pending.polling || pending.recovering) return;
+	pending.recovering = true;
+	SetApplySummary('Checking whether the same request is still an unused reservation. Running or completed work will remain unchanged.');
+	var fields = $j(document.formScriptActions).serializeArray();
+	for(var i=0; i<fields.length; i++) if(fields[i].name == 'action_script') fields[i].value = 'start_vpnmgrrecover_'+pending.requestId;
+	$j.ajax({
+		url:'/start_apply.htm',type:'POST',data:fields,dataType:'text',cache:false,timeout:15000,
+		error:function(){
+			if(vpnmgr_pendingApply !== pending || !pending.recovering) return;
+			pending.recovering = false;
+			BeginApplyPolling(pending,'apply');
+		},
+		success:function(){
+			if(vpnmgr_pendingApply !== pending || !pending.recovering) return;
+			pending.recovering = false;
+			BeginApplyPolling(pending,'apply');
+		}
+	});
 }
 
 function PollApplyStatus(pending){
 	if(vpnmgr_pendingApply !== pending || !pending.polling) return;
 	if(new Date().getTime()-pending.startedAt >= 120000){
 		pending.polling = false;
-		SetApplySummary('Completion is not confirmed yet. The same request remains active; continue checking to view its status.');
+		pending.timedOut = true;
+		SetApplySummary(pending.phase == 'apply' ? 'Apply status is unconfirmed. Continue checking asks the backend to expire this request only if it is still an unused reservation; running or completed work is not cancelled. Reload saved settings is available if you need to leave this page.' : 'Completion is not confirmed yet. The same request remains active; continue checking to view its status.');
 		$j('#btnContinueApply').show();
+		$j('#btnReloadSettings').show();
 		return;
 	}
 	$j.ajax({
@@ -880,6 +920,9 @@ function PollApplyStatus(pending){
 					return;
 				}
 			}
+			else if(data.state == 'ready'){
+				SetApplySummary('This request is still reserved and its settings submission is unconfirmed. No settings were resubmitted; continue checking after the reservation becomes recoverable.');
+			}
 			else if(ApplyResponseValid(data)){
 				RenderApplyStatus(data);
 				if(data.state == 'done' || data.state == 'failed' || data.state == 'superseded'){
@@ -900,7 +943,7 @@ function ApplyResponseValid(data){
 	if(typeof data.merged != 'boolean' || !data.clients || data.clients.length != 5) return false;
 	if(['ready','busy','running','expired','nonce_mismatch','unreserved','superseded','snapshot_failed','merge_failed','status_failed','interrupted','complete'].indexOf(data.message) == -1) return false;
 	for(var i=0; i<5; i++){
-		if(data.clients[i].slot != i+1 || ['pending','applying','applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1 || ['not_requested','connected','failed','unknown'].indexOf(data.clients[i].connection) == -1) return false;
+		if(data.clients[i].slot != i+1 || ['pending','applying','applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1 || ['not_requested','connected','verified_stopped','failed','unknown'].indexOf(data.clients[i].connection) == -1) return false;
 		if(data.state == 'done' && ['applied','failed','unmanaged'].indexOf(data.clients[i].status) == -1) return false;
 	}
 	return true;
@@ -918,8 +961,13 @@ function PostPreparedApply(pending){
 }
 
 function RenderApplyStatus(data){
-	for(var i=0; i<data.clients.length; i++) SetText('#vpnmgr_client_status_'+(i+1),data.clients[i].status+'; connection '+data.clients[i].connection);
+	for(var i=0; i<data.clients.length; i++) SetText('#vpnmgr_client_status_'+(i+1),data.clients[i].status+'; '+ConnectionStatusLabel(data.clients[i].connection));
 	if(data.state == 'running') SetApplySummary('Apply in progress for request '+data.request+'.');
+}
+
+function ConnectionStatusLabel(connection){
+	var labels = {not_requested:'connection not requested',connected:'connection verified active','verified_stopped':'verified; restored to stopped',failed:'connection failed',unknown:'connection status unknown'};
+	return labels[connection] || 'connection status unknown';
 }
 
 function ApplyMessageLabel(code){
@@ -946,7 +994,11 @@ function FinishApplyResult(pending,data){
 	var failed = [];
 	for(var i=0; i<data.clients.length; i++) if(data.clients[i].status == 'failed' || (data.clients[i].status == 'applied' && data.clients[i].connection == 'failed')) failed.push(i+1);
 	var connectionUnknown = false;
-	for(var c=0; c<data.clients.length; c++) if(data.clients[c].status == 'applied' && data.clients[c].connection != 'connected') connectionUnknown = true;
+	var verifiedStopped = false;
+	for(var c=0; c<data.clients.length; c++){
+		if(data.clients[c].status == 'applied' && data.clients[c].connection == 'verified_stopped') verifiedStopped = true;
+		else if(data.clients[c].status == 'applied' && data.clients[c].connection != 'connected') connectionUnknown = true;
+	}
 	if(data.merged && data.state != 'done'){
 		SetApplySummary('Settings saved, but apply ended as '+data.state+' ('+ApplyMessageLabel(data.message)+'). Review the per-client results.');
 	}
@@ -954,7 +1006,7 @@ function FinishApplyResult(pending,data){
 		SetApplySummary('Settings saved, but apply failed for VPN Client '+failed.join(', ')+'. '+ApplyMessageLabel(data.message)+'.');
 	}
 	else if(data.merged){
-		SetApplySummary(connectionUnknown ? 'Settings saved. Apply completed; review the per-client connection results.' : 'Settings saved. All managed client applies completed successfully.');
+		SetApplySummary(connectionUnknown ? 'Settings saved. Apply completed; review the per-client connection results.' : verifiedStopped ? 'Settings saved. Apply completed; stopped clients were verified and restored to stopped.' : 'Settings saved. All managed client applies completed successfully.');
 	}
 	else{
 		SetApplySummary('Settings were not merged. '+ApplyMessageLabel(data.message)+'. Correct the form and save again.');

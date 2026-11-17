@@ -51,7 +51,7 @@ Custom settings use separate shared, UDP and TCP lists for each family, with the
 
 CLI Choice 7 accepts individual clients, ranges and comma-separated combinations, such as `1,3-5`. Disabling VPNMgr custom settings leaves the existing custom-options block in place. The existing removal of a stale `verify-x509-name` restriction during server changes still applies. There is no custom-options backup, restore or migration feature.
 
-WebUI Save reserves an apply request before submitting settings and shows separate results for all five clients. Saved settings, configuration apply and connection results are reported separately. A failed or unconfirmed apply preserves the form; **Continue checking** follows the same request, and **Reload saved settings** explicitly reloads the page. Save stays disabled until complete settings and a valid runtime response have loaded.
+WebUI Save reserves an apply request before submitting settings and shows separate results for all five clients. Saved settings, configuration apply and connection results are reported separately, including clients verified and then restored to stopped. A failed or unconfirmed apply preserves the form. **Continue checking** follows the same request and asks the backend to expire an unused reservation after its deadline, without resubmitting settings or cancelling running work. **Reload saved settings** explicitly reloads the page. Save stays disabled until complete settings and a valid runtime response have loaded. An unchanged saved location missing from the current catalogue retains its ID; choosing another provider, country or city does not reuse that old ID.
 
 ## Repository layout
 
@@ -88,20 +88,16 @@ vpnmgr/
 
 ### Installing from a branch
 
-Resolve a branch once and pass that exact revision to the installer, so the initial script and its assets share the same source. For the upstream development branch:
+Use the normal download/chmod/install command with the published repository and branch URL. No separate installer or manually supplied SHA/provider variables are required:
 
 ```sh
-repository=h0me5k1n/vpnmgr
-branch=develop
-sha="$(/usr/sbin/curl -fsL --retry 3 -H 'Accept: application/vnd.github.sha' \
-  "https://api.github.com/repos/$repository/commits/$branch")" || exit 1
-case "$sha" in ''|*[!0-9a-fA-F]*) exit 1 ;; esac
-[ "${#sha}" -eq 40 ] || exit 1
 /usr/sbin/curl -fsL --retry 3 \
-  "https://raw.githubusercontent.com/$repository/$sha/vpnmgr.sh" \
+  "https://raw.githubusercontent.com/<owner>/<repository>/<branch>/vpnmgr.sh" \
   -o /jffs/scripts/vpnmgr && chmod 0755 /jffs/scripts/vpnmgr && \
-  VPNMGR_INSTALL_SHA="$sha" VPNMGR_INSTALL_BRANCH="$branch" /jffs/scripts/vpnmgr install
+  /jffs/scripts/vpnmgr install
 ```
+
+The installer resolves its configured source once, verifies the downloaded main script against that revision, and refetches/re-executes it if the branch moved. Its providers, WebUI and supporting files then use that same revision. Pinned test builds stop if resolution or verification fails, before normal installation writes. A test build with a branch override stays on its configured test branch for installs and updates.
 
 To switch a running installation between the stable release and the `develop` (pre-release) branch:
 
@@ -114,9 +110,9 @@ Each command is a one-off reinstall from that branch. The installed script still
 
 After `vpnmgr develop`, the CLI header and the WebUI version show which commit is installed, e.g. `v3.4.1 (develop@9a18d5f)`. Every file in that install comes from that one commit. Installing from `main` again, with `vpnmgr stable` or a normal update, removes the label.
 
-Installed full-revision metadata also controls asset repair, including builds with the same version number. Updates resolve a fresh candidate. Explicitly pinned development builds stop before downloads if their revision cannot be established; ordinary unpinned installs retain the historical branch fallback and report `unknown` provenance when the lookup fails.
+Installed revision metadata also controls asset repair, including builds with the same version number. Main-script provenance is recorded before dependent asset downloads; completion is recorded only after they all succeed. Updates resolve a fresh candidate. Ordinary builds without a branch override retain the historical raw-branch fallback when the API is unavailable, record `unknown` provenance, and can reopen without another lookup. This exceptional fallback does not claim exact-revision coherence. A later update can establish a pinned revision again.
 
-For controlled NordVPN testing while its status is `UNTESTED` or `API_TESTED`, set `VPNMGR_TEST_PROVIDERS=nordvpn` when invoking `install` or `forceupdate`. This persists a WebUI visibility opt-in for NordVPN without changing its status. Invoke an update with `VPNMGR_TEST_PROVIDERS=` to remove the opt-in. Other inactive providers are not enabled by it. Live account, generated router configuration, negotiated cipher, traffic and reconnect checks remain necessary.
+Pinned test builds with a branch override make NordVPN available in the WebUI automatically while retaining its honest `UNTESTED`/`API_TESTED` status. Other inactive providers are not enabled. An explicit `VPNMGR_TEST_PROVIDERS` choice remains an optional developer override. Live account, generated router configuration, negotiated cipher, traffic and reconnect checks remain necessary.
 
 ### Testing a provider locally
 

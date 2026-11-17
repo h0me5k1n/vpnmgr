@@ -575,7 +575,7 @@ section "13. Install source recording (offline)"
 
 _IS_DIR="$(mktemp -d)"
 _IS_EXTRACT="$(mktemp)"
-for _is_fn in Set_Version_Custom_Settings Pin_Script_Repo Script_Source_Identity Record_Install_Source; do
+for _is_fn in Set_Version_Custom_Settings Unpinned_Script_Repo Pin_Script_Repo Script_Source_Identity Record_Install_Source; do
     sed -n "/^${_is_fn}(){/,/^}/p" "${REPO_ROOT}/vpnmgr.sh"
 done | sed "s|/usr/sbin/curl|_is_curl|g; s|/jffs/addons/custom_settings.txt|${_IS_DIR}/custom_settings.txt|g" > "$_IS_EXTRACT"
 # shellcheck source=/dev/null

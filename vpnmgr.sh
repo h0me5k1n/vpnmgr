@@ -246,6 +246,11 @@ Set_Version_Custom_Settings(){
 # Points SCRIPT_REPO at the commit the branch currently resolves to, so every
 # file in the install comes from that one commit even if the branch moves
 # meanwhile, and sets SCRIPT_SOURCE to "<branch>@<short commit>".
+Unpinned_Script_Repo(){
+	SCRIPT_BRANCH="$1"; SCRIPT_REVISION=""
+	SCRIPT_REPO="https://raw.githubusercontent.com/$SCRIPT_REPOSITORY/$SCRIPT_BRANCH"
+	SCRIPT_SOURCE="$SCRIPT_BRANCH@unknown"
+}
 Pin_Script_Repo(){
 	_psr_branch="${SCRIPT_BRANCH_OVERRIDE:-$1}"
 	_psr_ok=false
@@ -266,9 +271,7 @@ Pin_Script_Repo(){
 			return 1
 		fi
 		Print_Output true "Could not look up the latest $_psr_branch commit - installing from the branch instead" "$WARN"
-		SCRIPT_BRANCH="$_psr_branch"; SCRIPT_REVISION=""
-		SCRIPT_REPO="https://raw.githubusercontent.com/$SCRIPT_REPOSITORY/$SCRIPT_BRANCH"
-		SCRIPT_SOURCE="$SCRIPT_BRANCH@unknown"
+		Unpinned_Script_Repo "$_psr_branch"
 	fi
 	SCRIPT_UPDATE_READY=true
 }
@@ -278,7 +281,7 @@ Ensure_Update_Source(){
 }
 
 Script_Source_Identity(){
-	printf '%s|%s|%s' "$SCRIPT_REPOSITORY" "$SCRIPT_BRANCH" "$SCRIPT_REVISION"
+	printf '%s|%s|%s' "$SCRIPT_REPOSITORY" "$SCRIPT_BRANCH" "${SCRIPT_REVISION:-unknown}"
 }
 
 Load_Installed_Source(){
@@ -288,7 +291,13 @@ Load_Installed_Source(){
 		[ -f "$SCRIPT_SOURCE_REVISION_FILE" ] || return 1
 		IFS='|' read -r _lis_repo _lis_branch _lis_sha < "$SCRIPT_SOURCE_REVISION_FILE" || return 1
 		[ "$_lis_repo" = "$SCRIPT_REPOSITORY" ] && [ -n "$_lis_branch" ] || return 1
-		Pin_Script_Repo "$_lis_branch" "$_lis_sha" || return 1
+		if [ "$_lis_sha" = unknown ] && [ -z "$SCRIPT_BRANCH_OVERRIDE" ]; then
+			# Ordinary API-failure fallback is explicitly unpinned. Reentry must
+			# not relabel an already installed branch script as a newly found SHA.
+			Unpinned_Script_Repo "$_lis_branch"
+		else
+			Pin_Script_Repo "$_lis_branch" "$_lis_sha" || return 1
+		fi
 	fi
 	# Installed provenance repairs this build; a later update chooses a new tip.
 	SCRIPT_UPDATE_READY=false
@@ -297,16 +306,21 @@ Load_Installed_Source(){
 Resolve_Installed_Source(){
 	if Load_Installed_Source; then return 0; fi
 	[ -z "${VPNMGR_INSTALL_SHA:-}" ] || return 1
-	# A test bootstrap must provide its already-resolved SHA, never resolve again.
+	# Strict builds require installed provenance; never adopt an unrelated tip.
 	[ -z "$SCRIPT_BRANCH_OVERRIDE" ] || {
-		Print_Output true "Missing exact test-build revision; install using VPNMGR_INSTALL_SHA" "$ERR"
+		Print_Output true "Missing exact test-build revision; rerun the normal repo install" "$ERR"
 		return 1
 	}
 	# Older updaters did not record a full revision. Only adopt a candidate when
 	# its script bytes match the script already running, before repairing assets.
 	Pin_Script_Repo "$SCRIPT_BRANCH" || return 1
 	SCRIPT_UPDATE_READY=false
-	[ -n "$SCRIPT_REVISION" ] || return 1
+	if [ -z "$SCRIPT_REVISION" ]; then
+		# Retain historical ordinary branch fallback, visibly unverified. Strict
+		# override builds and supplied SHAs cannot reach this compatibility path.
+		Record_Install_Source
+		return $?
+	fi
 	_ris_file="$(mktemp /tmp/vpnmgr-source.XXXXXX)" || return 1
 	if ! Download_File "$SCRIPT_REPO/$SCRIPT_NAME.sh" "$_ris_file" || ! cmp -s "$_ris_file" "/jffs/scripts/$SCRIPT_NAME"; then
 		rm -f "$_ris_file"
@@ -319,8 +333,15 @@ Resolve_Installed_Source(){
 }
 
 Configure_Test_Providers(){
-	[ "${VPNMGR_TEST_PROVIDERS+x}" = x ] || return 0
-	case "$VPNMGR_TEST_PROVIDERS" in
+	if [ "${VPNMGR_TEST_PROVIDERS+x}" = x ]; then
+		_ctp_selection="$VPNMGR_TEST_PROVIDERS"
+	elif [ -n "$SCRIPT_BRANCH_OVERRIDE" ] && [ -n "$SCRIPT_REVISION" ]; then
+		# Pinned branch builds expose NordVPN for testing without status promotion.
+		_ctp_selection=nordvpn
+	else
+		return 0
+	fi
+	case "$_ctp_selection" in
 		nordvpn) printf '%s\n' nordvpn > "$SCRIPT_TEST_PROVIDER_FILE" ;;
 		'') rm -f "$SCRIPT_TEST_PROVIDER_FILE" ;;
 		*) Print_Output true "Unsupported test-provider selection" "$ERR"; return 1 ;;
@@ -336,24 +357,41 @@ Provider_WebUI_Enabled(){
 Select_Install_Source(){
 	if [ -n "${VPNMGR_INSTALL_SHA:-}" ]; then
 		Pin_Script_Repo "${VPNMGR_INSTALL_BRANCH:-$SCRIPT_BRANCH}" "$VPNMGR_INSTALL_SHA"
-	elif [ -n "$SCRIPT_BRANCH_OVERRIDE" ]; then
-		Print_Output true "The test installer must receive its bootstrap's VPNMGR_INSTALL_SHA" "$ERR"
-		return 1
 	else
 		Pin_Script_Repo "$SCRIPT_BRANCH"
 	fi
 }
 
+Bootstrap_Install(){
+	# A normal branch download may race a newer branch tip. Verify the running
+	# script against the ONE selected revision before any install/config writes.
+	# The ordinary unpinned compatibility path must not reexec a moving branch.
+	[ -n "$SCRIPT_REVISION" ] || return 0
+	_bis_file="$(mktemp /jffs/scripts/.vpnmgr-bootstrap.XXXXXX)" || return 1
+	if ! Download_File "$SCRIPT_REPO/$SCRIPT_NAME.sh" "$_bis_file" ||
+		! grep -qF h0me5k1n "$_bis_file" || ! sh -n "$_bis_file"; then
+		rm -f "$_bis_file"
+		Print_Output true "Cannot verify the selected install script; stopping before installation" "$ERR"
+		return 1
+	fi
+	if cmp -s "$_bis_file" "$0"; then
+		rm -f "$_bis_file"
+		return 0
+	fi
+	chmod 0755 "$_bis_file" && mv -f "$_bis_file" "/jffs/scripts/$SCRIPT_NAME" || { rm -f "$_bis_file"; return 1; }
+	VPNMGR_INSTALL_SHA="$SCRIPT_REVISION" VPNMGR_INSTALL_BRANCH="$SCRIPT_BRANCH" exec "/jffs/scripts/$SCRIPT_NAME" install
+}
+
 # Records where the script just installed came from, for the CLI header and
 # WebUI. Installs from main show only the version, so the record is removed.
 Record_Install_Source(){
-	if [ -n "$SCRIPT_SOURCE" ] && [ -n "$SCRIPT_REVISION" ]; then
+	if [ -n "$SCRIPT_SOURCE" ]; then
 		Script_Source_Identity > "$SCRIPT_SOURCE_REVISION_FILE" || return 1
 		printf '\n' >> "$SCRIPT_SOURCE_REVISION_FILE" || return 1
 	else
 		rm -f "$SCRIPT_SOURCE_REVISION_FILE" || return 1
 	fi
-	if [ -n "$SCRIPT_SOURCE" ] && [ "${SCRIPT_SOURCE%%@*}" != "main" ]; then
+	if [ -n "$SCRIPT_SOURCE" ] && { [ "${SCRIPT_SOURCE%%@*}" != "main" ] || [ -z "$SCRIPT_REVISION" ]; }; then
 		printf '%s\n' "$SCRIPT_SOURCE" > "$SCRIPT_SOURCE_FILE"
 		Set_Version_Custom_Settings source "$SCRIPT_SOURCE"
 	else
@@ -1197,8 +1235,33 @@ Runtime_Status(){
 }
 Runtime_Release(){
 	[ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)" = "$_apply_id" ] || return 1
-	rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/ready"
+	rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$_apply_id"
 	rmdir "$VPNMGR_RUNTIME_DIR/apply.lock"
+}
+Runtime_Recover(){
+(
+	Runtime_ValidID "$1" && Runtime_Init || return 1
+	_apply_id="$1"
+	[ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)" = "$_apply_id" ] || return 0
+	_rr_ready="$VPNMGR_RUNTIME_DIR/apply.lock/ready.$_apply_id"
+	_rr_stamp="$(cat "$_rr_ready" 2>/dev/null)"
+	case "$_rr_stamp" in ''|*[!0-9]*) return 0 ;; esac
+	[ $(($(date +%s) - _rr_stamp)) -ge 60 ] || return 0
+	_rr_claim="$VPNMGR_RUNTIME_DIR/apply.lock/expired.$_apply_id.$$"
+	# Request-specific tokens prevent an old process claiming a newer lock.
+	# This rename competes atomically with Apply; running work is never expired.
+	mv "$_rr_ready" "$_rr_claim" 2>/dev/null || return 0
+	_apply_state=failed; _apply_message=expired; _apply_merged=false
+	for _apply_init in 1 2 3 4 5; do eval "_apply_status_$_apply_init=pending; _apply_connection_$_apply_init=unknown"; done
+	if ! Runtime_Status; then
+		# Retain a recoverable reservation when publication fails; never tell the
+		# browser to unlock its form without an authoritative terminal result.
+		mv "$_rr_claim" "$_rr_ready" 2>/dev/null || :
+		return 1
+	fi
+	rm -f "$_rr_claim" || return 1
+	Runtime_Release
+)
 }
 Runtime_Prepare(){
 	Runtime_ValidID "$1" && Runtime_Init || return 1
@@ -1207,26 +1270,11 @@ Runtime_Prepare(){
 	# Never overwrite the state of a repeated request, including completed work.
 	[ ! -f "$VPNMGR_RUNTIME_DIR/apply_${_apply_id}.json" ] || return 0
 	if ! mkdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null; then
-		_rt_ready="$VPNMGR_RUNTIME_DIR/apply.lock/ready"
-		_rt_stamp="$(cat "$_rt_ready" 2>/dev/null)"
-		case "$_rt_stamp" in ''|*[!0-9]*) ;; *)
-			_rt_now="$(date +%s)"
-			if [ $((_rt_now - _rt_stamp)) -ge 60 ]; then
-				# Rename claims the expired reservation; a worker first removes ready.
-				if mv "$_rt_ready" "$VPNMGR_RUNTIME_DIR/apply.lock/expired.$$" 2>/dev/null; then
-					_rt_expired_id="$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)"
-					if Runtime_ValidID "$_rt_expired_id"; then
-						_rt_new_id="$_apply_id"; _apply_id="$_rt_expired_id"; _apply_state=superseded; _apply_message=expired; Runtime_Status || { rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/expired.$$"; rmdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null || :; return 1; }
-						_apply_id="$_rt_new_id"; _apply_state=busy; _apply_message=busy
-					fi
-					rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/owner" "$VPNMGR_RUNTIME_DIR/apply.lock/expired.$$"
-					rmdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null || :
-				fi
-			fi ;;
-		esac
+		_rt_expired_id="$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)"
+		if Runtime_ValidID "$_rt_expired_id"; then Runtime_Recover "$_rt_expired_id" || return 1; fi
 		mkdir "$VPNMGR_RUNTIME_DIR/apply.lock" 2>/dev/null || { Runtime_Status; return $?; }
 	fi
-	(umask 077; printf '%s\n' "$_apply_id" > "$VPNMGR_RUNTIME_DIR/apply.lock/owner" && date +%s > "$VPNMGR_RUNTIME_DIR/apply.lock/ready") || { Runtime_Release; return 1; }
+	(umask 077; printf '%s\n' "$_apply_id" > "$VPNMGR_RUNTIME_DIR/apply.lock/owner" && date +%s > "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$_apply_id") || { Runtime_Release; return 1; }
 	_apply_state=ready; _apply_message=ready
 	Runtime_Status || { Runtime_Release; return 1; }
 }
@@ -1271,7 +1319,7 @@ Runtime_Apply(){
 	trap 'Runtime_Apply_Cleanup' EXIT
 	trap 'exit 1' HUP INT TERM
 	# Atomic claim competes with expiry and duplicate event execution.
-	mv "$VPNMGR_RUNTIME_DIR/apply.lock/ready" "$VPNMGR_RUNTIME_DIR/apply.lock/running.$$" 2>/dev/null || return 0
+	mv "$VPNMGR_RUNTIME_DIR/apply.lock/ready.$_apply_id" "$VPNMGR_RUNTIME_DIR/apply.lock/running.$_apply_id.$$" 2>/dev/null || return 0
 	_apply_state=running; _apply_message=running
 	Runtime_Status || { _apply_message=status_failed; return 1; }
 	if ! (umask 077; cp "${VPNMGR_SETTINGS_FILE:-/jffs/addons/custom_settings.txt}" "$_apply_snapshot"); then
@@ -1309,7 +1357,7 @@ Runtime_Apply(){
 )
 }
 Runtime_Apply_Cleanup(){
-	[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/running.$$" ] || return 0
+	[ -f "$VPNMGR_RUNTIME_DIR/apply.lock/running.$_apply_id.$$" ] || return 0
 	rm -f "$_apply_snapshot" "$VPNMGR_PRIVATE_DIR/merge.$$" "$VPNMGR_PRIVATE_DIR/config.$$" "$VPNMGR_PRIVATE_DIR/config.$$.next"
 	if [ "$(cat "$VPNMGR_RUNTIME_DIR/apply.lock/owner" 2>/dev/null)" = "$_apply_id" ]; then
 		if [ "$_apply_terminal" != true ]; then
@@ -1317,7 +1365,7 @@ Runtime_Apply_Cleanup(){
 			[ "$_apply_message" = status_failed ] || _apply_message=interrupted
 			Runtime_Status || :
 		fi
-		rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/running.$$"
+		rm -f "$VPNMGR_RUNTIME_DIR/apply.lock/running.$_apply_id.$$"
 		Runtime_Release || :
 	fi
 }
@@ -1913,7 +1961,10 @@ UpdateVPNConfig(){
 
 	if [ "$PRIOR_CONN_STATE" != "2" ] && nvram get vpn_clientx_eas | grep -q "$VPN_NO" && [ "$(getConnectState "$VPN_NO")" = "2" ]; then
 		Print_Output true "VPN client $VPN_NO was not connected before configuration - stopping it again to restore that state" "$WARN"
+		VPNMGR_UPDATE_CONNECTION=unknown
 		service stop_vpnclient"$VPN_NO" >/dev/null 2>&1 || return 1
+		[ "$(getConnectState "$VPN_NO")" = 0 ] || return 1
+		VPNMGR_UPDATE_CONNECTION=verified_stopped
 	fi
 
 	[ "$VPNMGR_UPDATE_CONNECTION" != failed ] || return 1
@@ -3220,6 +3271,9 @@ Menu_Install(){
 	Create_Dirs
 	Conf_Exists
 	Configure_Test_Providers || return 1
+	# Main-script provenance is already verified by Bootstrap_Install. Retain it
+	# even if a dependency fails; .files_source records successful assets only.
+	Record_Install_Source || return 1
 	Auto_Cron create 2>/dev/null
 	Auto_Startup create 2>/dev/null
 	Auto_ServiceEvent create 2>/dev/null
@@ -3426,6 +3480,7 @@ fi
 case "$1" in
 	install)
 		Select_Install_Source || exit 1
+		Bootstrap_Install || exit 1
 		Check_Lock
 		Menu_Install
 		_install_rc=$?
@@ -3453,6 +3508,7 @@ case "$1" in
 			case "$3" in
 				"${SCRIPT_NAME}runtime_"*) Runtime_Detect "${3#${SCRIPT_NAME}runtime_}"; exit $? ;;
 				"${SCRIPT_NAME}prepare_"*) Runtime_Prepare "${3#${SCRIPT_NAME}prepare_}"; exit $? ;;
+				"${SCRIPT_NAME}recover_"*) Runtime_Recover "${3#${SCRIPT_NAME}recover_}"; exit $? ;;
 				"${SCRIPT_NAME}apply_"*) Runtime_Apply "${3#${SCRIPT_NAME}apply_}"; exit $? ;;
 			esac
 		fi
